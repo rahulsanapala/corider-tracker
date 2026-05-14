@@ -206,7 +206,7 @@ class MainActivity : Activity(), RideBus.Listener {
     private fun render(state: RideState) {
         startButton.isEnabled = !state.active
         stopButton.isEnabled = state.active
-        statusView.text = state.status
+        statusView.text = locationStatus(state)
         radarView.setState(state)
 
         val now = System.currentTimeMillis()
@@ -227,6 +227,17 @@ class MainActivity : Activity(), RideBus.Listener {
 
     private fun hasRequiredPermissions(): Boolean {
         return hasLocationPermission()
+    }
+
+    private fun locationStatus(state: RideState): String {
+        val own = state.ownLocation
+        val now = System.currentTimeMillis()
+        val ownText = if (own == null) {
+            "No local GPS fix yet"
+        } else {
+            "Your GPS ${own.ageSeconds(now)}s ago, ${own.accuracyM} m accuracy"
+        }
+        return "${state.status}\n$ownText - receiving ${state.riders.size} rider(s)"
     }
 
     private fun permissionsToRequest(): Array<String> {
