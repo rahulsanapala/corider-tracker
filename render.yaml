@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: corider-relay
+    env: docker
+    healthCheckPath: /healthz
+
