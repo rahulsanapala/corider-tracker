@@ -74,6 +74,9 @@ class RideRelayHandler(BaseHTTPRequestHandler):
             if self.path == "/" or self.path == "/healthz":
                 self.handle_health()
                 return
+            if self.path == "/debug":
+                self.handle_debug()
+                return
             ride_id, action = self.parse_ride_path()
             if action != "events":
                 self.send_error(HTTPStatus.NOT_FOUND)
@@ -96,6 +99,26 @@ class RideRelayHandler(BaseHTTPRequestHandler):
 
     def handle_health(self) -> None:
         body = compact_json({"ok": True, "service": "corider-relay"})
+        self.send_response(HTTPStatus.OK)
+        self.send_cors_headers()
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def handle_debug(self) -> None:
+        with ROOMS_LOCK:
+            rooms = list(ROOMS.items())
+        payload = {
+            "rooms": {
+                ride_id: {
+                    "clients": len(room.clients),
+                    "latest": sorted(room.latest.keys()),
+                }
+                for ride_id, room in rooms
+            }
+        }
+        body = compact_json(payload)
         self.send_response(HTTPStatus.OK)
         self.send_cors_headers()
         self.send_header("Content-Type", "application/json")
