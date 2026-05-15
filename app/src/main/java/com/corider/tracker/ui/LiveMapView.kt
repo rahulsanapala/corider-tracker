@@ -1,6 +1,7 @@
 package com.corider.tracker.ui
 
 import android.content.Context
+import android.os.SystemClock
 import android.widget.FrameLayout
 import com.corider.tracker.RideState
 import com.corider.tracker.RiderSnapshot
@@ -18,6 +19,7 @@ class LiveMapView(context: Context) : FrameLayout(context) {
     private var accuracyCircle: Polygon? = null
     private var state = RideState()
     private var followOwnLocation = true
+    private val interpolator = android.view.animation.AccelerateDecelerateInterpolator()
 
     init {
         Configuration.getInstance().userAgentValue = context.packageName
@@ -56,7 +58,8 @@ class LiveMapView(context: Context) : FrameLayout(context) {
                 map = mapView,
                 position = own.toGeoPoint(),
                 title = "You",
-                snippet = own.snippet(now)
+                snippet = own.snippet(now),
+                bearingDeg = own.bearingDeg
             )
             updateAccuracyCircle(own)
             if (followOwnLocation) moveCamera(own)
@@ -75,7 +78,8 @@ class LiveMapView(context: Context) : FrameLayout(context) {
                 map = mapView,
                 position = rider.toGeoPoint(),
                 title = rider.label,
-                snippet = rider.snippet(now)
+                snippet = rider.snippet(now),
+                bearingDeg = rider.bearingDeg
             )
         }
         mapView.invalidate()
@@ -101,11 +105,13 @@ class LiveMapView(context: Context) : FrameLayout(context) {
         map: MapView,
         position: GeoPoint,
         title: String,
-        snippet: String
+        snippet: String,
+        bearingDeg: Int
     ): Marker {
         val existing = this
         if (existing != null) {
-            existing.position = position
+            animateMarker(existing, position, animationDurationMs(bearingDeg))
+            updateHeading(existing, bearingDeg)
             existing.title = title
             existing.subDescription = snippet
             return existing
@@ -114,8 +120,44 @@ class LiveMapView(context: Context) : FrameLayout(context) {
             this.position = position
             this.title = title
             this.subDescription = snippet
+            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+            updateHeading(this, bearingDeg)
             map.overlays.add(this)
         }
+    }
+
+    private fun updateHeading(marker: Marker, bearingDeg: Int) {
+        marker.rotation = if (bearingDeg in 0..359) bearingDeg.toFloat() else 0f
+    }
+
+    private fun animationDurationMs(bearingDeg: Int): Long {
+        return if (bearingDeg in 0..359) 1000L else 1300L
+    }
+
+    private fun animateMarker(marker: Marker, target: GeoPoint, durationMs: Long) {
+        val start = marker.position
+        val startLat = start.latitude
+        val startLon = start.longitude
+        val deltaLat = target.latitude - startLat
+        val deltaLon = target.longitude - startLon
+        val startMs = SystemClock.uptimeMillis()
+
+        val step = object : Runnable {
+            override fun run() {
+                val elapsed = (SystemClock.uptimeMillis() - startMs).coerceAtLeast(0L)
+                val t = (elapsed.toFloat() / durationMs).coerceIn(0f, 1f)
+                val eased = interpolator.getInterpolation(t)
+                marker.position = GeoPoint(
+                    startLat + deltaLat * eased,
+                    startLon + deltaLon * eased
+                )
+                mapView.invalidate()
+                if (t < 1f) {
+                    mapView.postOnAnimation(this)
+                }
+            }
+        }
+        mapView.post(step)
     }
 
     private fun RiderSnapshot.toGeoPoint(): GeoPoint = GeoPoint(latitude, longitude)
