@@ -15,6 +15,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import com.corider.tracker.BuildConfig
 import com.corider.tracker.location.LiveLocationService
 import com.corider.tracker.ui.LiveMapView
 import java.util.Locale
@@ -29,6 +30,7 @@ class MainActivity : Activity(), RideBus.Listener {
     private lateinit var centerButton: Button
     private lateinit var statusView: TextView
     private lateinit var ridersView: TextView
+    private lateinit var mapHintView: TextView
     private lateinit var mapView: LiveMapView
 
     private val prefs by lazy { getSharedPreferences("ride", Context.MODE_PRIVATE) }
@@ -170,6 +172,13 @@ class MainActivity : Activity(), RideBus.Listener {
             mapView,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
         )
+        mapHintView = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.rgb(185, 28, 28))
+            setPadding(0, dp(8), 0, 0)
+            visibility = TextView.GONE
+        }
+        root.addView(mapHintView, matchWrap())
 
         ridersView = TextView(this).apply {
             textSize = 14f
@@ -240,6 +249,10 @@ class MainActivity : Activity(), RideBus.Listener {
         centerButton.isEnabled = state.ownLocation != null
         statusView.text = locationStatus(state)
         mapView.setState(state)
+        mapHintView.visibility = if (hasPlaceholderMapsKey()) TextView.VISIBLE else TextView.GONE
+        if (hasPlaceholderMapsKey()) {
+            mapHintView.text = "Google Maps key missing. Add MAPS_API_KEY in local.properties."
+        }
 
         val now = System.currentTimeMillis()
         val own = state.ownLocation
@@ -323,5 +336,10 @@ class MainActivity : Activity(), RideBus.Listener {
         private const val KEY_RIDER_NAME = "rider_name"
         private const val KEY_RELAY_URL = "relay_url"
         private const val KEY_RIDER_ID = "rider_id"
+    }
+
+    private fun hasPlaceholderMapsKey(): Boolean {
+        val key = BuildConfig.MAPS_API_KEY
+        return key.isBlank() || key == "YOUR_GOOGLE_MAPS_API_KEY"
     }
 }
