@@ -11,10 +11,14 @@ import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polygon
+import org.osmdroid.views.overlay.Polyline
+import java.util.ArrayDeque
 
 class LiveMapView(context: Context) : FrameLayout(context) {
     private val mapView: MapView
     private val riderMarkers = LinkedHashMap<String, Marker>()
+    private val riderTrails = LinkedHashMap<String, Polyline>()
+    private val trailPoints = LinkedHashMap<String, ArrayDeque<GeoPoint>>()
     private var ownMarker: Marker? = null
     private var accuracyCircle: Polygon? = null
     private var state = RideState()
@@ -71,6 +75,10 @@ class LiveMapView(context: Context) : FrameLayout(context) {
             riderMarkers.remove(id)?.let { marker ->
                 mapView.overlays.remove(marker)
             }
+            riderTrails.remove(id)?.let { trail ->
+                mapView.overlays.remove(trail)
+            }
+            trailPoints.remove(id)
         }
 
         visible.values.forEach { rider ->
@@ -81,6 +89,7 @@ class LiveMapView(context: Context) : FrameLayout(context) {
                 snippet = rider.snippet(now),
                 bearingDeg = rider.bearingDeg
             )
+            updateTrail(rider.id, rider.toGeoPoint())
         }
         mapView.invalidate()
     }
@@ -165,5 +174,33 @@ class LiveMapView(context: Context) : FrameLayout(context) {
     private fun RiderSnapshot.snippet(nowMs: Long): String {
         val speedKmh = (speedMps * 3.6).toInt()
         return "${ageSeconds(nowMs)}s ago - $speedKmh km/h - $accuracyM m accuracy"
+    }
+
+    private fun updateTrail(riderId: String, point: GeoPoint) {
+        val points = trailPoints.getOrPut(riderId) { ArrayDeque() }
+        val last = points.lastOrNull()
+        if (last == null || distanceMeters(last, point) >= MIN_TRAIL_POINT_DISTANCE_M) {
+            points.addLast(point)
+            while (points.size > MAX_TRAIL_POINTS) {
+                points.removeFirst()
+            }
+        }
+
+        val trail = riderTrails[riderId] ?: Polyline().also { poly ->
+            poly.outlinePaint.color = 0xAA10B981.toInt()
+            poly.outlinePaint.strokeWidth = 5f
+            riderTrails[riderId] = poly
+            mapView.overlays.add(poly)
+        }
+        trail.setPoints(points.toList())
+    }
+
+    private fun distanceMeters(a: GeoPoint, b: GeoPoint): Double {
+        return a.distanceToAsDouble(b)
+    }
+
+    companion object {
+        private const val MAX_TRAIL_POINTS = 30
+        private const val MIN_TRAIL_POINT_DISTANCE_M = 4.0
     }
 }
