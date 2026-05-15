@@ -67,6 +67,18 @@ object RideBus {
         }
     }
 
+    fun setGroupAlert(alert: GroupAlert?) {
+        update { it.copy(groupAlert = alert) }
+    }
+
+    fun setRegroupPoint(point: RegroupPoint?) {
+        update { it.copy(regroupPoint = point) }
+    }
+
+    fun setUpdateMode(mode: UpdateMode) {
+        update { it.copy(updateMode = mode) }
+    }
+
     private fun update(block: (RideState) -> RideState) {
         val next = synchronized(this) {
             state = block(state).dropStaleRiders()

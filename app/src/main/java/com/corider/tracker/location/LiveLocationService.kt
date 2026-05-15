@@ -17,10 +17,14 @@ import com.corider.tracker.MainActivity
 import com.corider.tracker.R
 import com.corider.tracker.RideBus
 import com.corider.tracker.RiderSnapshot
+import com.corider.tracker.GroupAlert
+import com.corider.tracker.RegroupPoint
+import com.corider.tracker.UpdateMode
 import com.google.firebase.database.ChildEventListener
 import com.google.firebase.database.DataSnapshot
 import com.google.firebase.database.DatabaseError
 import com.google.firebase.database.FirebaseDatabase
+import com.google.firebase.database.ValueEventListener
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -30,10 +34,15 @@ class LiveLocationService : Service(), LocationListener {
     private var riderId: String = ""
     private var riderName: String = ""
     private var rideRefPath: String = ""
+    private var rideRootPath: String = ""
     private var running = false
     private var publishExecutor: ExecutorService? = null
     private val gate = LocationGate()
+    private var lastOwnSnapshot: RiderSnapshot? = null
     private var riderEventsListener: ChildEventListener? = null
+    private var alertListener: ValueEventListener? = null
+    private var regroupListener: ValueEventListener? = null
+    private var modeListener: ValueEventListener? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -46,6 +55,12 @@ class LiveLocationService : Service(), LocationListener {
             ACTION_STOP -> {
                 stopTracking(sendLeave = true)
                 stopSelf()
+            }
+            ACTION_SOS -> publishSos()
+            ACTION_REGROUP -> publishRegroup()
+            ACTION_SET_MODE -> {
+                val mode = intent.getStringExtra(EXTRA_MODE).orEmpty()
+                setMode(mode)
             }
         }
         return START_STICKY
@@ -61,6 +76,7 @@ class LiveLocationService : Service(), LocationListener {
     override fun onLocationChanged(location: Location) {
         val now = System.currentTimeMillis()
         val snapshot = RiderSnapshot.fromLocation(riderId, riderName, location, now)
+        lastOwnSnapshot = snapshot
         RideBus.updateOwnLocation(snapshot)
 
         if (!gate.shouldPublish(location, now)) return
@@ -90,6 +106,7 @@ class LiveLocationService : Service(), LocationListener {
         riderId = intent.getStringExtra(EXTRA_RIDER_ID).orEmpty()
         riderName = intent.getStringExtra(EXTRA_RIDER_NAME).orEmpty()
         rideRefPath = "rides/$rideId/riders"
+        rideRootPath = "rides/$rideId"
 
         if (rideId.isBlank() || riderId.isBlank()) {
             RideBus.setStatus("Missing ride details")
@@ -104,6 +121,7 @@ class LiveLocationService : Service(), LocationListener {
         startForeground(NOTIFICATION_ID, buildNotification())
         RideBus.setRide(rideId, riderId, riderName)
         startFirebaseListener()
+        startGroupEventListeners()
         requestLocationUpdates()
     }
 
@@ -168,6 +186,7 @@ class LiveLocationService : Service(), LocationListener {
             ridersRef?.removeEventListener(listener)
         }
         riderEventsListener = null
+        removeGroupEventListeners()
 
         val leavingPath = rideRefPath
         val leavingRider = riderId
@@ -223,11 +242,61 @@ class LiveLocationService : Service(), LocationListener {
         const val EXTRA_RIDE_ID = "ride_id"
         const val EXTRA_RIDER_ID = "rider_id"
         const val EXTRA_RIDER_NAME = "rider_name"
+        const val ACTION_SOS = "com.corider.tracker.SOS"
+        const val ACTION_REGROUP = "com.corider.tracker.REGROUP"
+        const val ACTION_SET_MODE = "com.corider.tracker.SET_MODE"
+        const val EXTRA_MODE = "update_mode"
 
         private const val CHANNEL_ID = "ride_tracking"
         private const val NOTIFICATION_ID = 701
         private const val SAMPLE_INTERVAL_MS = 2_000L
         private const val SAMPLE_DISTANCE_M = 3f
+    }
+
+    private fun startGroupEventListeners() {
+        val root = FirebaseDatabase.getInstance().getReference(rideRootPath)
+        alertListener = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                val msg = snapshot.child("message").getValue(String::class.java) ?: return
+                val id = snapshot.child("riderId").getValue(String::class.java) ?: return
+                val name = snapshot.child("riderName").getValue(String::class.java) ?: "Rider"
+                val ts = snapshot.child("timestampMs").getValue(Long::class.java) ?: System.currentTimeMillis()
+                RideBus.setGroupAlert(GroupAlert(id, name, msg, ts))
+            }
+            override fun onCancelled(error: DatabaseError) = Unit
+        }
+        regroupListener = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                val id = snapshot.child("riderId").getValue(String::class.java) ?: return
+                val name = snapshot.child("riderName").getValue(String::class.java) ?: "Rider"
+                val lat = snapshot.child("latE7").getValue(Int::class.java) ?: return
+                val lon = snapshot.child("lonE7").getValue(Int::class.java) ?: return
+                val ts = snapshot.child("timestampMs").getValue(Long::class.java) ?: System.currentTimeMillis()
+                RideBus.setRegroupPoint(RegroupPoint(id, name, lat, lon, ts))
+            }
+            override fun onCancelled(error: DatabaseError) = Unit
+        }
+        modeListener = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                val value = snapshot.getValue(String::class.java) ?: "NORMAL"
+                RideBus.setUpdateMode(runCatching { UpdateMode.valueOf(value) }.getOrDefault(UpdateMode.NORMAL))
+            }
+            override fun onCancelled(error: DatabaseError) = Unit
+        }
+        root.child("events").child("sos").addValueEventListener(alertListener as ValueEventListener)
+        root.child("events").child("regroup").addValueEventListener(regroupListener as ValueEventListener)
+        root.child("settings").child("mode").addValueEventListener(modeListener as ValueEventListener)
+    }
+
+    private fun removeGroupEventListeners() {
+        if (rideRootPath.isBlank()) return
+        val root = FirebaseDatabase.getInstance().getReference(rideRootPath)
+        alertListener?.let { root.child("events").child("sos").removeEventListener(it) }
+        regroupListener?.let { root.child("events").child("regroup").removeEventListener(it) }
+        modeListener?.let { root.child("settings").child("mode").removeEventListener(it) }
+        alertListener = null
+        regroupListener = null
+        modeListener = null
     }
 
     private fun publishSnapshot(snapshot: RiderSnapshot) {
@@ -245,6 +314,35 @@ class LiveLocationService : Service(), LocationListener {
             .getReference(rideRefPath)
             .child(snapshot.id)
             .setValue(payload)
+    }
+
+    private fun publishSos() {
+        if (rideRootPath.isBlank()) return
+        val payload = mapOf(
+            "riderId" to riderId,
+            "riderName" to riderName,
+            "message" to "SOS",
+            "timestampMs" to System.currentTimeMillis()
+        )
+        FirebaseDatabase.getInstance().getReference(rideRootPath).child("events").child("sos").setValue(payload)
+    }
+
+    private fun publishRegroup() {
+        val own = lastOwnSnapshot ?: return
+        val payload = mapOf(
+            "riderId" to riderId,
+            "riderName" to riderName,
+            "latE7" to own.latE7,
+            "lonE7" to own.lonE7,
+            "timestampMs" to System.currentTimeMillis()
+        )
+        FirebaseDatabase.getInstance().getReference(rideRootPath).child("events").child("regroup").setValue(payload)
+    }
+
+    private fun setMode(modeText: String) {
+        val mode = runCatching { UpdateMode.valueOf(modeText) }.getOrDefault(UpdateMode.NORMAL)
+        FirebaseDatabase.getInstance().getReference(rideRootPath).child("settings").child("mode").setValue(mode.name)
+        RideBus.setUpdateMode(mode)
     }
 
     private fun readRiderSnapshot(snapshot: DataSnapshot): RiderSnapshot? {

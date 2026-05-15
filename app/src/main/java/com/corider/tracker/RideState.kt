@@ -11,8 +11,31 @@ data class RideState(
     val riderName: String = "",
     val status: String = "Ready",
     val ownLocation: RiderSnapshot? = null,
-    val riders: Map<String, RiderSnapshot> = emptyMap()
+    val riders: Map<String, RiderSnapshot> = emptyMap(),
+    val groupAlert: GroupAlert? = null,
+    val regroupPoint: RegroupPoint? = null,
+    val updateMode: UpdateMode = UpdateMode.NORMAL
 )
+
+data class GroupAlert(
+    val riderId: String,
+    val riderName: String,
+    val message: String,
+    val timestampMs: Long
+)
+
+data class RegroupPoint(
+    val riderId: String,
+    val riderName: String,
+    val latE7: Int,
+    val lonE7: Int,
+    val timestampMs: Long
+) {
+    val latitude: Double get() = latE7 / 10_000_000.0
+    val longitude: Double get() = lonE7 / 10_000_000.0
+}
+
+enum class UpdateMode { ECO, NORMAL, FAST }
 
 data class RiderSnapshot(
     val id: String,
@@ -64,4 +87,3 @@ data class RiderSnapshot(
         }
     }
 }
-

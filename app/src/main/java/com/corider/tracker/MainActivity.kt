@@ -28,8 +28,18 @@ class MainActivity : Activity(), RideBus.Listener {
     private lateinit var stopButton: Button
     private lateinit var centerButton: Button
     private lateinit var statusView: TextView
+    private lateinit var tabMapButton: Button
+    private lateinit var tabGroupButton: Button
+    private lateinit var sosButton: Button
+    private lateinit var regroupButton: Button
+    private lateinit var modeEcoButton: Button
+    private lateinit var modeNormalButton: Button
+    private lateinit var modeFastButton: Button
+    private lateinit var groupHealthView: TextView
     private lateinit var ridersView: TextView
     private lateinit var mapView: LiveMapView
+    private lateinit var mapTabContainer: LinearLayout
+    private lateinit var groupTabContainer: LinearLayout
 
     private val prefs by lazy { getSharedPreferences("ride", Context.MODE_PRIVATE) }
     private val riderId by lazy { getOrCreateRiderId() }
@@ -155,10 +165,45 @@ class MainActivity : Activity(), RideBus.Listener {
         }
         root.addView(statusView, matchWrap())
 
+        val tabs = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        tabMapButton = Button(this).apply {
+            text = "Map"
+            setOnClickListener { switchTab(isMapTab = true) }
+        }
+        tabGroupButton = Button(this).apply {
+            text = "Group"
+            setOnClickListener { switchTab(isMapTab = false) }
+        }
+        tabs.addView(tabMapButton, LinearLayout.LayoutParams(0, dp(44), 1f))
+        tabs.addView(tabGroupButton, LinearLayout.LayoutParams(0, dp(44), 1f).apply { leftMargin = dp(8) })
+        root.addView(tabs, matchWrap())
+
+        mapTabContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        groupTabContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        val mapActions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        sosButton = Button(this).apply {
+            text = "SOS"
+            setOnClickListener { dispatchServiceAction(LiveLocationService.ACTION_SOS) }
+        }
+        regroupButton = Button(this).apply {
+            text = "Regroup"
+            setOnClickListener { dispatchServiceAction(LiveLocationService.ACTION_REGROUP) }
+        }
+        mapActions.addView(sosButton, LinearLayout.LayoutParams(0, dp(44), 1f))
+        mapActions.addView(regroupButton, LinearLayout.LayoutParams(0, dp(44), 1f).apply { leftMargin = dp(8) })
+        mapTabContainer.addView(mapActions, matchWrap())
+
         mapView = LiveMapView(this).apply {
             onCreate()
         }
-        root.addView(
+        mapTabContainer.addView(
             mapView,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
         )
@@ -169,9 +214,47 @@ class MainActivity : Activity(), RideBus.Listener {
         }
         val scroll = ScrollView(this)
         scroll.addView(ridersView)
-        root.addView(scroll, LinearLayout.LayoutParams.MATCH_PARENT, dp(120))
+        mapTabContainer.addView(scroll, LinearLayout.LayoutParams.MATCH_PARENT, dp(120))
+
+        groupHealthView = TextView(this).apply {
+            textSize = 14f
+            setTextColor(Color.rgb(30, 41, 59))
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        groupTabContainer.addView(groupHealthView, matchWrap())
+
+        val modeRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        modeEcoButton = Button(this).apply {
+            text = "Eco"
+            setOnClickListener { setMode(UpdateMode.ECO) }
+        }
+        modeNormalButton = Button(this).apply {
+            text = "Normal"
+            setOnClickListener { setMode(UpdateMode.NORMAL) }
+        }
+        modeFastButton = Button(this).apply {
+            text = "Fast"
+            setOnClickListener { setMode(UpdateMode.FAST) }
+        }
+        modeRow.addView(modeEcoButton, LinearLayout.LayoutParams(0, dp(44), 1f))
+        modeRow.addView(modeNormalButton, LinearLayout.LayoutParams(0, dp(44), 1f).apply { leftMargin = dp(8) })
+        modeRow.addView(modeFastButton, LinearLayout.LayoutParams(0, dp(44), 1f).apply { leftMargin = dp(8) })
+        groupTabContainer.addView(modeRow, matchWrap())
+
+        root.addView(
+            mapTabContainer,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+        )
+        root.addView(
+            groupTabContainer,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+        )
 
         setContentView(root)
+        switchTab(isMapTab = true)
     }
 
     private fun requestStart() {
@@ -226,8 +309,12 @@ class MainActivity : Activity(), RideBus.Listener {
         startButton.isEnabled = !state.active
         stopButton.isEnabled = state.active
         centerButton.isEnabled = state.ownLocation != null
+        sosButton.isEnabled = state.active
+        regroupButton.isEnabled = state.active && state.ownLocation != null
         statusView.text = locationStatus(state)
         mapView.setState(state)
+        updateGroupTab(state)
+        highlightMode(state.updateMode)
 
         val now = System.currentTimeMillis()
         val own = state.ownLocation
@@ -302,5 +389,39 @@ class MainActivity : Activity(), RideBus.Listener {
         private const val KEY_RIDE_CODE = "ride_code"
         private const val KEY_RIDER_NAME = "rider_name"
         private const val KEY_RIDER_ID = "rider_id"
+    }
+
+    private fun switchTab(isMapTab: Boolean) {
+        mapTabContainer.visibility = if (isMapTab) LinearLayout.VISIBLE else LinearLayout.GONE
+        groupTabContainer.visibility = if (isMapTab) LinearLayout.GONE else LinearLayout.VISIBLE
+    }
+
+    private fun updateGroupTab(state: RideState) {
+        val now = System.currentTimeMillis()
+        val riders = state.riders.values
+        val moving = riders.count { it.speedMps > 1.0 }
+        val stale = riders.count { it.isStale(now) }
+        val own = state.ownLocation
+        val maxGap = riders.maxOfOrNull { own?.distanceTo(it)?.toInt() ?: 0 } ?: 0
+        val alert = state.groupAlert?.let { "SOS by ${it.riderName}" } ?: "No SOS"
+        val regroup = state.regroupPoint?.let { "Regroup set by ${it.riderName}" } ?: "No regroup point"
+        groupHealthView.text =
+            "Riders: ${riders.size}\nMoving: $moving\nOffline/Stale: $stale\nMax gap: ${maxGap}m\n$alert\n$regroup"
+    }
+
+    private fun setMode(mode: UpdateMode) {
+        dispatchServiceAction(LiveLocationService.ACTION_SET_MODE, LiveLocationService.EXTRA_MODE, mode.name)
+    }
+
+    private fun dispatchServiceAction(action: String, extraKey: String? = null, extraValue: String? = null) {
+        val intent = Intent(this, LiveLocationService::class.java).setAction(action)
+        if (extraKey != null && extraValue != null) intent.putExtra(extraKey, extraValue)
+        startService(intent)
+    }
+
+    private fun highlightMode(mode: UpdateMode) {
+        modeEcoButton.isEnabled = mode != UpdateMode.ECO
+        modeNormalButton.isEnabled = mode != UpdateMode.NORMAL
+        modeFastButton.isEnabled = mode != UpdateMode.FAST
     }
 }
