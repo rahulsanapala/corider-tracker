@@ -16,7 +16,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import com.corider.tracker.location.LiveLocationService
-import com.corider.tracker.ui.RadarView
+import com.corider.tracker.ui.LiveMapView
 import java.util.Locale
 import java.util.UUID
 
@@ -26,9 +26,10 @@ class MainActivity : Activity(), RideBus.Listener {
     private lateinit var relayUrlInput: EditText
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
+    private lateinit var centerButton: Button
     private lateinit var statusView: TextView
     private lateinit var ridersView: TextView
-    private lateinit var radarView: RadarView
+    private lateinit var mapView: LiveMapView
 
     private val prefs by lazy { getSharedPreferences("ride", Context.MODE_PRIVATE) }
     private val riderId by lazy { getOrCreateRiderId() }
@@ -36,7 +37,12 @@ class MainActivity : Activity(), RideBus.Listener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        buildUi()
+        buildUi(savedInstanceState)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::mapView.isInitialized) mapView.onResume()
     }
 
     override fun onStart() {
@@ -47,6 +53,21 @@ class MainActivity : Activity(), RideBus.Listener {
     override fun onStop() {
         RideBus.removeListener(this)
         super.onStop()
+    }
+
+    override fun onPause() {
+        if (::mapView.isInitialized) mapView.onPause()
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        if (::mapView.isInitialized) mapView.onDestroy()
+        super.onDestroy()
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        if (::mapView.isInitialized) mapView.onLowMemory()
     }
 
     override fun onRideStateChanged(state: RideState) {
@@ -69,7 +90,7 @@ class MainActivity : Activity(), RideBus.Listener {
         }
     }
 
-    private fun buildUi() {
+    private fun buildUi(savedInstanceState: Bundle?) {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.rgb(247, 248, 250))
@@ -120,8 +141,16 @@ class MainActivity : Activity(), RideBus.Listener {
             isEnabled = false
             setOnClickListener { stopRide() }
         }
+        centerButton = Button(this).apply {
+            text = "Center"
+            isEnabled = false
+            setOnClickListener { mapView.centerOnMe() }
+        }
         controls.addView(startButton, LinearLayout.LayoutParams(0, dp(48), 1f))
         controls.addView(stopButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply {
+            leftMargin = dp(8)
+        })
+        controls.addView(centerButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply {
             leftMargin = dp(8)
         })
         root.addView(controls, matchWrap())
@@ -134,9 +163,11 @@ class MainActivity : Activity(), RideBus.Listener {
         }
         root.addView(statusView, matchWrap())
 
-        radarView = RadarView(this)
+        mapView = LiveMapView(this).apply {
+            onCreate(savedInstanceState)
+        }
         root.addView(
-            radarView,
+            mapView,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
         )
 
@@ -206,8 +237,9 @@ class MainActivity : Activity(), RideBus.Listener {
     private fun render(state: RideState) {
         startButton.isEnabled = !state.active
         stopButton.isEnabled = state.active
+        centerButton.isEnabled = state.ownLocation != null
         statusView.text = locationStatus(state)
-        radarView.setState(state)
+        mapView.setState(state)
 
         val now = System.currentTimeMillis()
         val own = state.ownLocation

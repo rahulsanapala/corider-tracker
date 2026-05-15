@@ -4,11 +4,11 @@ Native Android starter for joining a shared ride and tracking nearby co-riders w
 
 The starter uses:
 
-- Android Kotlin with no third-party app dependencies.
+- Android Kotlin.
+- Google Maps SDK for Android for the live rider map.
 - A foreground location service so tracking can continue while the app is not in front.
 - Adaptive publishing: location is sent only after meaningful movement, speed changes, or a heartbeat.
 - A tiny Python relay server that keeps one Server-Sent Events stream open per rider and accepts compact location POSTs.
-- A simple radar-style view instead of a map SDK, so the project runs without API keys. You can add Google Maps or OpenStreetMap later.
 
 ## Project Layout
 
@@ -18,6 +18,7 @@ The starter uses:
 - `docs/WINDOWS_SETUP.md` - full Android Studio setup for Windows.
 - `docs/LIGHTWEIGHT_BUILD.md` - command-line and GitHub Actions build flow.
 - `docs/DEPLOY_PUBLIC_RELAY.md` - public HTTPS relay deployment.
+- `docs/GOOGLE_MAPS_SETUP.md` - Google Maps API key setup.
 
 ## Run The Relay
 
