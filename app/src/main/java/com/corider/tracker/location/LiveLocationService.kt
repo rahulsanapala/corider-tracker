@@ -17,23 +17,23 @@ import com.corider.tracker.MainActivity
 import com.corider.tracker.R
 import com.corider.tracker.RideBus
 import com.corider.tracker.RiderSnapshot
-import com.corider.tracker.net.CompactLocationPayload
-import com.corider.tracker.net.RideApi
+import com.google.firebase.database.ChildEventListener
+import com.google.firebase.database.DataSnapshot
+import com.google.firebase.database.DatabaseError
+import com.google.firebase.database.FirebaseDatabase
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import kotlin.math.min
 
 class LiveLocationService : Service(), LocationListener {
     private lateinit var locationManager: LocationManager
     private var rideId: String = ""
     private var riderId: String = ""
     private var riderName: String = ""
-    private var relayUrl: String = ""
-    private var api: RideApi? = null
+    private var rideRefPath: String = ""
     private var running = false
-    private var streamThread: Thread? = null
     private var publishExecutor: ExecutorService? = null
     private val gate = LocationGate()
+    private var riderEventsListener: ChildEventListener? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -66,14 +66,12 @@ class LiveLocationService : Service(), LocationListener {
         if (!gate.shouldPublish(location, now)) return
         gate.markPublished(location, now)
 
-        val payload = CompactLocationPayload.fromSnapshot(snapshot)
         publishExecutor?.execute {
-            val client = api ?: return@execute
             try {
-                client.publishLocation(rideId, payload)
-                RideBus.setStatus("Shared location with ${payload.accuracyM} m accuracy")
+                publishSnapshot(snapshot)
+                RideBus.setStatus("Shared location with ${snapshot.accuracyM} m accuracy")
             } catch (error: Exception) {
-                RideBus.setStatus("Waiting for relay: ${error.message ?: "network error"}")
+                RideBus.setStatus("Waiting for Firebase: ${error.message ?: "network error"}")
             }
         }
     }
@@ -91,9 +89,9 @@ class LiveLocationService : Service(), LocationListener {
         rideId = intent.getStringExtra(EXTRA_RIDE_ID).orEmpty()
         riderId = intent.getStringExtra(EXTRA_RIDER_ID).orEmpty()
         riderName = intent.getStringExtra(EXTRA_RIDER_NAME).orEmpty()
-        relayUrl = intent.getStringExtra(EXTRA_RELAY_URL).orEmpty()
+        rideRefPath = "rides/$rideId/riders"
 
-        if (rideId.isBlank() || riderId.isBlank() || relayUrl.isBlank()) {
+        if (rideId.isBlank() || riderId.isBlank()) {
             RideBus.setStatus("Missing ride details")
             stopSelf()
             return
@@ -101,12 +99,11 @@ class LiveLocationService : Service(), LocationListener {
 
         stopTracking(sendLeave = false)
         running = true
-        api = RideApi(relayUrl)
         publishExecutor = Executors.newSingleThreadExecutor()
 
         startForeground(NOTIFICATION_ID, buildNotification())
         RideBus.setRide(rideId, riderId, riderName)
-        startEventStream()
+        startFirebaseListener()
         requestLocationUpdates()
     }
 
@@ -129,35 +126,34 @@ class LiveLocationService : Service(), LocationListener {
             locationManager.requestLocationUpdates(provider, SAMPLE_INTERVAL_MS, SAMPLE_DISTANCE_M, this)
             locationManager.getLastKnownLocation(provider)?.let { onLocationChanged(it) }
         }
-        RideBus.setStatus("Listening for GPS and relay updates")
+        RideBus.setStatus("Listening for GPS and Firebase updates")
     }
 
-    private fun startEventStream() {
-        streamThread = Thread {
-            var backoffMs = 1_000L
-            while (running) {
-                try {
-                    api?.streamRide(
-                        rideId = rideId,
-                        riderId = riderId,
-                        onLocation = { payload -> RideBus.updateRider(payload.toSnapshot()) },
-                        onLeft = { id -> RideBus.removeRider(id) },
-                        shouldContinue = { running }
-                    )
-                    backoffMs = 1_000L
-                } catch (error: Exception) {
-                    if (running) {
-                        RideBus.setStatus("Relay reconnecting: ${error.message ?: "stream closed"}")
-                        Thread.sleep(backoffMs)
-                        backoffMs = min(backoffMs * 2, 15_000L)
-                    }
+    private fun startFirebaseListener() {
+        val listenersRef = FirebaseDatabase.getInstance().getReference(rideRefPath)
+        riderEventsListener = object : ChildEventListener {
+            override fun onChildAdded(snapshot: DataSnapshot, previousChildName: String?) {
+                readRiderSnapshot(snapshot)?.let { if (it.id != riderId) RideBus.updateRider(it) }
+            }
+
+            override fun onChildChanged(snapshot: DataSnapshot, previousChildName: String?) {
+                readRiderSnapshot(snapshot)?.let { if (it.id != riderId) RideBus.updateRider(it) }
+            }
+
+            override fun onChildRemoved(snapshot: DataSnapshot) {
+                val id = snapshot.key ?: return
+                RideBus.removeRider(id)
+            }
+
+            override fun onChildMoved(snapshot: DataSnapshot, previousChildName: String?) = Unit
+
+            override fun onCancelled(error: DatabaseError) {
+                if (running) {
+                    RideBus.setStatus("Firebase listener error: ${error.message}")
                 }
             }
-        }.apply {
-            name = "ride-event-stream"
-            isDaemon = true
-            start()
         }
+        listenersRef.addChildEventListener(riderEventsListener as ChildEventListener)
     }
 
     private fun stopTracking(sendLeave: Boolean) {
@@ -167,21 +163,24 @@ class LiveLocationService : Service(), LocationListener {
             locationManager.removeUpdates(this)
         } catch (_: Exception) {
         }
-        streamThread?.interrupt()
-        streamThread = null
+        val ridersRef = if (rideRefPath.isNotBlank()) FirebaseDatabase.getInstance().getReference(rideRefPath) else null
+        riderEventsListener?.let { listener ->
+            ridersRef?.removeEventListener(listener)
+        }
+        riderEventsListener = null
 
-        val client = api
-        val leavingRide = rideId
+        val leavingPath = rideRefPath
         val leavingRider = riderId
         val executor = publishExecutor
         executor?.execute {
-            if (sendLeave && wasRunning && client != null && leavingRide.isNotBlank()) {
-                runCatching { client.leaveRide(leavingRide, leavingRider) }
+            if (sendLeave && wasRunning && leavingPath.isNotBlank()) {
+                runCatching {
+                    FirebaseDatabase.getInstance().getReference(leavingPath).child(leavingRider).removeValue()
+                }
             }
         }
         executor?.shutdown()
         publishExecutor = null
-        api = null
         if (wasRunning) {
             stopForeground(STOP_FOREGROUND_REMOVE)
             RideBus.stopRide()
@@ -224,11 +223,39 @@ class LiveLocationService : Service(), LocationListener {
         const val EXTRA_RIDE_ID = "ride_id"
         const val EXTRA_RIDER_ID = "rider_id"
         const val EXTRA_RIDER_NAME = "rider_name"
-        const val EXTRA_RELAY_URL = "relay_url"
 
         private const val CHANNEL_ID = "ride_tracking"
         private const val NOTIFICATION_ID = 701
         private const val SAMPLE_INTERVAL_MS = 2_000L
         private const val SAMPLE_DISTANCE_M = 3f
+    }
+
+    private fun publishSnapshot(snapshot: RiderSnapshot) {
+        val payload = mapOf(
+            "id" to snapshot.id,
+            "name" to snapshot.name,
+            "latE7" to snapshot.latE7,
+            "lonE7" to snapshot.lonE7,
+            "speedCentiMps" to snapshot.speedCentiMps,
+            "bearingDeg" to snapshot.bearingDeg,
+            "accuracyM" to snapshot.accuracyM,
+            "updatedAtMs" to snapshot.updatedAtMs
+        )
+        FirebaseDatabase.getInstance()
+            .getReference(rideRefPath)
+            .child(snapshot.id)
+            .setValue(payload)
+    }
+
+    private fun readRiderSnapshot(snapshot: DataSnapshot): RiderSnapshot? {
+        val id = snapshot.child("id").getValue(String::class.java) ?: snapshot.key ?: return null
+        val name = snapshot.child("name").getValue(String::class.java) ?: ""
+        val latE7 = snapshot.child("latE7").getValue(Int::class.java) ?: return null
+        val lonE7 = snapshot.child("lonE7").getValue(Int::class.java) ?: return null
+        val speed = snapshot.child("speedCentiMps").getValue(Int::class.java) ?: 0
+        val bearing = snapshot.child("bearingDeg").getValue(Int::class.java) ?: -1
+        val accuracy = snapshot.child("accuracyM").getValue(Int::class.java) ?: -1
+        val updatedAt = snapshot.child("updatedAtMs").getValue(Long::class.java) ?: System.currentTimeMillis()
+        return RiderSnapshot(id, name, latE7, lonE7, speed, bearing, accuracy, updatedAt)
     }
 }

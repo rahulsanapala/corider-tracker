@@ -1,14 +1,15 @@
 # CoRider Tracker
 
-Native Android starter for joining a shared ride and tracking nearby co-riders with low network usage.
+Native Android app for joining a shared ride and tracking nearby co-riders with low network usage.
 
 The starter uses:
 
 - Android Kotlin.
-- Google Maps SDK for Android for the live rider map.
+- OpenStreetMap via `osmdroid` for the live rider map.
+- Firebase Realtime Database for live location sync.
+- Firebase Anonymous Auth for rider identity.
 - A foreground location service so tracking can continue while the app is not in front.
 - Adaptive publishing: location is sent only after meaningful movement, speed changes, or a heartbeat.
-- A tiny Python relay server that keeps one Server-Sent Events stream open per rider and accepts compact location POSTs.
 
 ## Project Layout
 
@@ -18,7 +19,7 @@ The starter uses:
 - `docs/WINDOWS_SETUP.md` - full Android Studio setup for Windows.
 - `docs/LIGHTWEIGHT_BUILD.md` - command-line and GitHub Actions build flow.
 - `docs/DEPLOY_PUBLIC_RELAY.md` - public HTTPS relay deployment.
-- `docs/GOOGLE_MAPS_SETUP.md` - Google Maps API key setup.
+- `docs/FIREBASE_OSM_SETUP.md` - Firebase + OpenStreetMap setup.
 
 ## Run The Relay
 

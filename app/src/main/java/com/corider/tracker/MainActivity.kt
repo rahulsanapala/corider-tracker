@@ -15,7 +15,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import com.corider.tracker.BuildConfig
+import com.google.firebase.auth.FirebaseAuth
 import com.corider.tracker.location.LiveLocationService
 import com.corider.tracker.ui.LiveMapView
 import java.util.Locale
@@ -24,13 +24,11 @@ import java.util.UUID
 class MainActivity : Activity(), RideBus.Listener {
     private lateinit var rideCodeInput: EditText
     private lateinit var riderNameInput: EditText
-    private lateinit var relayUrlInput: EditText
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
     private lateinit var centerButton: Button
     private lateinit var statusView: TextView
     private lateinit var ridersView: TextView
-    private lateinit var mapHintView: TextView
     private lateinit var mapView: LiveMapView
 
     private val prefs by lazy { getSharedPreferences("ride", Context.MODE_PRIVATE) }
@@ -122,14 +120,6 @@ class MainActivity : Activity(), RideBus.Listener {
         }
         root.addView(riderNameInput, matchWrap())
 
-        relayUrlInput = EditText(this).apply {
-            hint = "Relay URL (https://...)"
-            setSingleLine(true)
-            setText(prefs.getString(KEY_RELAY_URL, DEFAULT_RELAY_URL))
-            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_URI
-        }
-        root.addView(relayUrlInput, matchWrap())
-
         val controls = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -166,20 +156,12 @@ class MainActivity : Activity(), RideBus.Listener {
         root.addView(statusView, matchWrap())
 
         mapView = LiveMapView(this).apply {
-            onCreate(savedInstanceState)
+            onCreate()
         }
         root.addView(
             mapView,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
         )
-        mapHintView = TextView(this).apply {
-            textSize = 13f
-            setTextColor(Color.rgb(185, 28, 28))
-            setPadding(0, dp(8), 0, 0)
-            visibility = TextView.GONE
-        }
-        root.addView(mapHintView, matchWrap())
-
         ridersView = TextView(this).apply {
             textSize = 14f
             setTextColor(Color.rgb(15, 23, 42))
@@ -205,36 +187,33 @@ class MainActivity : Activity(), RideBus.Listener {
     private fun startRide() {
         val rideCode = rideCodeInput.text.toString().trim().uppercase(Locale.US)
         val riderName = riderNameInput.text.toString().trim().ifBlank { "Rider" }
-        val relayUrl = normalizeRelayUrl(relayUrlInput.text.toString())
 
         if (rideCode.isBlank()) {
             statusView.text = "Enter a ride code."
             return
         }
-        if (!relayUrl.startsWith("https://") && !relayUrl.startsWith("http://")) {
-            statusView.text = "Enter your public relay URL."
-            return
-        }
-        relayUrlInput.setText(relayUrl)
 
         prefs.edit()
             .putString(KEY_RIDE_CODE, rideCode)
             .putString(KEY_RIDER_NAME, riderName)
-            .putString(KEY_RELAY_URL, relayUrl)
             .apply()
 
-        val intent = Intent(this, LiveLocationService::class.java)
-            .setAction(LiveLocationService.ACTION_START)
-            .putExtra(LiveLocationService.EXTRA_RIDE_ID, rideCode)
-            .putExtra(LiveLocationService.EXTRA_RIDER_ID, riderId)
-            .putExtra(LiveLocationService.EXTRA_RIDER_NAME, riderName)
-            .putExtra(LiveLocationService.EXTRA_RELAY_URL, relayUrl)
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
+        FirebaseAuth.getInstance().signInAnonymously()
+            .addOnSuccessListener {
+                val intent = Intent(this, LiveLocationService::class.java)
+                    .setAction(LiveLocationService.ACTION_START)
+                    .putExtra(LiveLocationService.EXTRA_RIDE_ID, rideCode)
+                    .putExtra(LiveLocationService.EXTRA_RIDER_ID, riderId)
+                    .putExtra(LiveLocationService.EXTRA_RIDER_NAME, riderName)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(intent)
+                } else {
+                    startService(intent)
+                }
+            }
+            .addOnFailureListener { error ->
+                statusView.text = "Firebase auth failed: ${error.message ?: "unknown"}"
+            }
     }
 
     private fun stopRide() {
@@ -249,10 +228,6 @@ class MainActivity : Activity(), RideBus.Listener {
         centerButton.isEnabled = state.ownLocation != null
         statusView.text = locationStatus(state)
         mapView.setState(state)
-        mapHintView.visibility = if (hasPlaceholderMapsKey()) TextView.VISIBLE else TextView.GONE
-        if (hasPlaceholderMapsKey()) {
-            mapHintView.text = "Google Maps key missing. Add MAPS_API_KEY in local.properties."
-        }
 
         val now = System.currentTimeMillis()
         val own = state.ownLocation
@@ -311,13 +286,6 @@ class MainActivity : Activity(), RideBus.Listener {
         return id
     }
 
-    private fun normalizeRelayUrl(raw: String): String {
-        return raw.trim()
-            .trimEnd('/')
-            .removeSuffix("/healthz")
-            .removeSuffix("/")
-    }
-
     private fun matchWrap(): LinearLayout.LayoutParams {
         return LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -331,15 +299,8 @@ class MainActivity : Activity(), RideBus.Listener {
 
     companion object {
         private const val REQUEST_PERMISSIONS = 41
-        private const val DEFAULT_RELAY_URL = ""
         private const val KEY_RIDE_CODE = "ride_code"
         private const val KEY_RIDER_NAME = "rider_name"
-        private const val KEY_RELAY_URL = "relay_url"
         private const val KEY_RIDER_ID = "rider_id"
-    }
-
-    private fun hasPlaceholderMapsKey(): Boolean {
-        val key = BuildConfig.MAPS_API_KEY
-        return key.isBlank() || key == "YOUR_GOOGLE_MAPS_API_KEY"
     }
 }

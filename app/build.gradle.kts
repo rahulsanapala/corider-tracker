@@ -1,18 +1,7 @@
-import java.util.Properties
-
 plugins {
     id("com.android.application")
+    id("com.google.gms.google-services")
 }
-
-val localProperties = Properties()
-val localPropertiesFile = rootProject.file("local.properties")
-if (localPropertiesFile.isFile) {
-    localPropertiesFile.inputStream().use { localProperties.load(it) }
-}
-
-val mapsApiKey = providers.gradleProperty("MAPS_API_KEY")
-    .orElse(providers.environmentVariable("MAPS_API_KEY"))
-    .orElse(localProperties.getProperty("MAPS_API_KEY") ?: "YOUR_GOOGLE_MAPS_API_KEY")
 
 android {
     namespace = "com.corider.tracker"
@@ -24,8 +13,6 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
-        manifestPlaceholders["MAPS_API_KEY"] = mapsApiKey.get()
-        buildConfigField("String", "MAPS_API_KEY", "\"${mapsApiKey.get()}\"")
     }
 
     compileOptions {
@@ -39,5 +26,8 @@ android {
 }
 
 dependencies {
-    implementation("com.google.android.gms:play-services-maps:20.0.0")
+    implementation(platform("com.google.firebase:firebase-bom:34.2.0"))
+    implementation("com.google.firebase:firebase-auth")
+    implementation("com.google.firebase:firebase-database")
+    implementation("org.osmdroid:osmdroid-android:6.1.20")
 }
