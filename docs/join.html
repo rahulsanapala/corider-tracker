@@ -75,13 +75,15 @@
       code.textContent = "Ask the rider to share the group code again.";
       openApp.style.display = "none";
     } else {
-      const deepLink = "corider://join?ride=" + encodeURIComponent(ride) +
+      const query = "ride=" + encodeURIComponent(ride) +
         (name ? "&name=" + encodeURIComponent(name) : "");
+      const intentLink = "intent://join?" + query +
+        "#Intent;scheme=corider;package=com.corider.tracker;end";
       message.textContent = "Group code";
       code.textContent = ride;
-      openApp.href = deepLink;
+      openApp.href = intentLink;
       setTimeout(() => {
-        window.location.href = deepLink;
+        window.location.href = intentLink;
       }, 250);
     }
   </script>
