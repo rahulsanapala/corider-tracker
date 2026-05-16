@@ -11,6 +11,8 @@ import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
@@ -51,6 +53,9 @@ class LiveLocationService : Service(), LocationListener {
     private var localStationarySinceMs = 0L
     private var lastPublishedSafetyCheckId = ""
     private var lastNotifiedSafetyCheckId = ""
+    private var lastServiceSosToneTimestampMs = 0L
+    private var groupEventsStartedAtMs = 0L
+    private var sosTone: ToneGenerator? = null
     private val handler = Handler(Looper.getMainLooper())
 
     override fun onCreate() {
@@ -79,6 +84,8 @@ class LiveLocationService : Service(), LocationListener {
 
     override fun onDestroy() {
         stopTracking(sendLeave = true)
+        sosTone?.release()
+        sosTone = null
         super.onDestroy()
     }
 
@@ -116,25 +123,30 @@ class LiveLocationService : Service(), LocationListener {
     override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) = Unit
 
     private fun startTracking(intent: Intent) {
-        rideId = intent.getStringExtra(EXTRA_RIDE_ID).orEmpty()
-        riderId = intent.getStringExtra(EXTRA_RIDER_ID).orEmpty()
-        riderName = intent.getStringExtra(EXTRA_RIDER_NAME).orEmpty()
-        rideRefPath = "rides/$rideId/riders"
-        rideRootPath = "rides/$rideId"
+        val nextRideId = intent.getStringExtra(EXTRA_RIDE_ID).orEmpty()
+        val nextRiderId = intent.getStringExtra(EXTRA_RIDER_ID).orEmpty()
+        val nextRiderName = intent.getStringExtra(EXTRA_RIDER_NAME).orEmpty()
 
-        if (rideId.isBlank() || riderId.isBlank()) {
+        if (nextRideId.isBlank() || nextRiderId.isBlank()) {
             RideBus.setStatus("Missing ride details")
             stopSelf()
             return
         }
 
         stopTracking(sendLeave = false)
+        rideId = nextRideId
+        riderId = nextRiderId
+        riderName = nextRiderName
+        rideRefPath = "rides/$rideId/riders"
+        rideRootPath = "rides/$rideId"
         running = true
         publishExecutor = Executors.newSingleThreadExecutor()
         safetyRiders = LinkedHashMap()
         localStationarySinceMs = 0L
         lastPublishedSafetyCheckId = ""
         lastNotifiedSafetyCheckId = ""
+        lastServiceSosToneTimestampMs = 0L
+        groupEventsStartedAtMs = System.currentTimeMillis()
 
         startForeground(NOTIFICATION_ID, buildNotification())
         RideBus.setRide(rideId, riderId, riderName)
@@ -294,6 +306,7 @@ class LiveLocationService : Service(), LocationListener {
         private const val SAFETY_CHANNEL_ID = "ride_safety"
         private const val NOTIFICATION_ID = 701
         private const val SAFETY_NOTIFICATION_ID = 702
+        private const val SOS_NOTIFICATION_ID = 703
         private const val SAMPLE_INTERVAL_MS = 3_000L
         private const val SAMPLE_DISTANCE_M = 5f
         private const val STATIONARY_SPEED_MPS = 0.8
@@ -310,7 +323,9 @@ class LiveLocationService : Service(), LocationListener {
                 val id = snapshot.child("riderId").getValue(String::class.java) ?: return
                 val name = snapshot.child("riderName").getValue(String::class.java) ?: "Rider"
                 val ts = snapshot.child("timestampMs").getValue(Long::class.java) ?: System.currentTimeMillis()
-                RideBus.setGroupAlert(GroupAlert(id, name, msg, ts))
+                val alert = GroupAlert(id, name, msg, ts)
+                RideBus.setGroupAlert(alert)
+                playServiceSosAlert(alert)
             }
             override fun onCancelled(error: DatabaseError) = Unit
         }
@@ -389,12 +404,12 @@ class LiveLocationService : Service(), LocationListener {
     }
 
     private fun publishSos() {
-        if (rideRootPath.isBlank()) return
+        if (!running || rideRootPath.isBlank()) return
         publishSosFor(riderId, riderName, "SOS")
     }
 
     private fun publishSosFor(alertRiderId: String, alertRiderName: String, message: String) {
-        if (rideRootPath.isBlank()) return
+        if (!running || rideRootPath.isBlank()) return
         val payload = mapOf(
             "riderId" to alertRiderId,
             "riderName" to alertRiderName,
@@ -405,6 +420,7 @@ class LiveLocationService : Service(), LocationListener {
     }
 
     private fun publishRegroup() {
+        if (!running || rideRootPath.isBlank()) return
         val own = lastOwnSnapshot ?: return
         val payload = mapOf(
             "riderId" to riderId,
@@ -417,7 +433,7 @@ class LiveLocationService : Service(), LocationListener {
     }
 
     private fun clearRegroup() {
-        if (rideRootPath.isBlank()) return
+        if (!running || rideRootPath.isBlank()) return
         FirebaseDatabase.getInstance().getReference(rideRootPath).child("events").child("regroup").removeValue()
         RideBus.setRegroupPoint(null)
     }
@@ -536,6 +552,39 @@ class LiveLocationService : Service(), LocationListener {
         }
 
         manager.notify(SAFETY_NOTIFICATION_ID, builder.build())
+    }
+
+    private fun playServiceSosAlert(alert: GroupAlert) {
+        if (alert.timestampMs <= groupEventsStartedAtMs || alert.timestampMs <= lastServiceSosToneTimestampMs) return
+        lastServiceSosToneTimestampMs = alert.timestampMs
+
+        val tone = sosTone ?: ToneGenerator(AudioManager.STREAM_ALARM, 100).also { sosTone = it }
+        tone.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 1200)
+        handler.postDelayed({
+            sosTone?.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 1200)
+        }, 1400L)
+        notifySosAlert(alert)
+    }
+
+    private fun notifySosAlert(alert: GroupAlert) {
+        val manager = getSystemService(NotificationManager::class.java)
+        ensureSafetyNotificationChannel(manager)
+
+        val openIntent = PendingIntent.getActivity(
+            this,
+            SOS_NOTIFICATION_ID,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val notification = Notification.Builder(this, SAFETY_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_ride_notification)
+            .setContentTitle("SOS in $rideId")
+            .setContentText("${alert.riderName}: ${alert.message}")
+            .setContentIntent(openIntent)
+            .setAutoCancel(true)
+            .build()
+        manager.notify(SOS_NOTIFICATION_ID, notification)
     }
 
     private fun scheduleSafetyEscalation(check: SafetyCheck) {

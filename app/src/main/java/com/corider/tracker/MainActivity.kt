@@ -8,8 +8,6 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.media.AudioManager
-import android.media.ToneGenerator
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -38,6 +36,7 @@ class MainActivity : Activity(), RideBus.Listener {
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
     private lateinit var statusView: TextView
+    private lateinit var topBar: LinearLayout
     private lateinit var pageTitle: TextView
     private lateinit var setupPanel: LinearLayout
 
@@ -77,9 +76,6 @@ class MainActivity : Activity(), RideBus.Listener {
     private var currentState = RideState()
     private var rideActive = false
     private var hasRegroupPoint = false
-    private var lastSosToneTimestampMs = 0L
-    private val ignoreExistingSosBeforeMs = System.currentTimeMillis()
-    private var sosTone: ToneGenerator? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -115,8 +111,6 @@ class MainActivity : Activity(), RideBus.Listener {
 
     override fun onDestroy() {
         if (::mapView.isInitialized) mapView.onDestroy()
-        sosTone?.release()
-        sosTone = null
         super.onDestroy()
     }
 
@@ -151,7 +145,8 @@ class MainActivity : Activity(), RideBus.Listener {
             setBackgroundColor(SURFACE)
         }
 
-        root.addView(buildTopBar(), LinearLayout.LayoutParams.MATCH_PARENT, dp(70))
+        topBar = buildTopBar()
+        root.addView(topBar, LinearLayout.LayoutParams.MATCH_PARENT, dp(70))
 
         val contentFrame = FrameLayout(this).apply {
             setBackgroundColor(SURFACE)
@@ -206,13 +201,15 @@ class MainActivity : Activity(), RideBus.Listener {
 
             livePill = TextView(this@MainActivity).apply {
                 text = "●  Ready"
-                textSize = 14f
+                textSize = 15f
                 typeface = Typeface.DEFAULT_BOLD
                 setTextColor(Color.WHITE)
-                setPadding(dp(12), dp(8), dp(12), dp(8))
+                setPadding(dp(14), dp(9), dp(14), dp(9))
                 background = statusPill(active = false)
                 visibility = View.GONE
+                setOnClickListener { openActiveGroupFromMap() }
             }
+            addView(livePill, overlayParams(Gravity.TOP or Gravity.START, left = 18, top = 150))
 
             setupPanel = buildSetupPanel()
             setupPanel.visibility = View.GONE
@@ -229,7 +226,7 @@ class MainActivity : Activity(), RideBus.Listener {
             val actions = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER
-                setPadding(dp(18), 0, dp(18), 0)
+                setPadding(dp(24), 0, dp(24), 0)
             }
             sosButton = bigActionButton("SOS", DANGER, Color.rgb(255, 116, 124)).apply {
                 setOnClickListener { dispatchServiceAction(LiveLocationService.ACTION_SOS) }
@@ -244,7 +241,7 @@ class MainActivity : Activity(), RideBus.Listener {
                 }
             }
             actions.addView(sosButton, LinearLayout.LayoutParams(0, dp(68), 1f))
-            actions.addView(regroupButton, LinearLayout.LayoutParams(0, dp(68), 1f).apply { leftMargin = dp(18) })
+            actions.addView(regroupButton, LinearLayout.LayoutParams(0, dp(68), 1f).apply { leftMargin = dp(12) })
             addView(actions, overlayParams(Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL, bottom = 94))
 
             onlinePill = TextView(this@MainActivity).apply {
@@ -370,9 +367,10 @@ class MainActivity : Activity(), RideBus.Listener {
         if (groups.isEmpty()) {
             val emptyPanel = panel()
             emptyPanel.addView(sectionTitle("NO GROUPS YET"), matchWrapNoMargin())
-            emptyPanel.addView(bodyText("Create your first riding group to start sharing location with selected riders."), matchWrap(top = 8))
-            emptyPanel.addView(createGroupPanel(), matchWrap(top = 16))
+            emptyPanel.addView(bodyText("Create a new riding group or join one using an invite code."), matchWrap(top = 8))
             groupContent.addView(emptyPanel, matchWrapNoMargin())
+            groupContent.addView(createGroupPanel(), matchWrap(top = 18))
+            groupContent.addView(joinGroupPanel(collapsed = true), matchWrap(top = 18))
             return
         }
 
@@ -402,6 +400,7 @@ class MainActivity : Activity(), RideBus.Listener {
         }
 
         groupContent.addView(createGroupPanel(), matchWrap(top = 18))
+        groupContent.addView(joinGroupPanel(collapsed = true), matchWrap(top = 18))
     }
 
     private fun renderGroupDetail(groupCode: String) {
@@ -486,6 +485,54 @@ class MainActivity : Activity(), RideBus.Listener {
         }
         panel.addView(create, matchWrap(top = 12))
         return panel
+    }
+
+    private fun joinGroupPanel(collapsed: Boolean): LinearLayout {
+        val panel = panel()
+        panel.addView(sectionTitle("JOIN GROUP"), matchWrapNoMargin())
+        panel.addView(bodyText("Use the group code shared by another rider."), matchWrap(top = 8))
+
+        if (collapsed) {
+            val showJoin = smallCommand("JOIN GROUP", GREEN).apply {
+                setOnClickListener { renderJoinGroupForm() }
+            }
+            panel.addView(showJoin, matchWrap(top = 12))
+            return panel
+        }
+
+        val codeInput = input("Enter group code", "").apply {
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
+        }
+        panel.addView(codeInput, matchWrap(top = 12))
+
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val join = smallCommand("JOIN", BLUE).apply {
+            setOnClickListener {
+                val code = codeInput.text.toString().trim().uppercase(Locale.US)
+                if (code.isBlank()) {
+                    statusView.text = "Enter a group code to join."
+                    return@setOnClickListener
+                }
+                saveGroup(LocalGroup(code, groupNameForCode(code)))
+                renderGroupDetail(code)
+            }
+        }
+        val cancel = smallCommand("CANCEL", PILL).apply {
+            setOnClickListener { renderGroupList() }
+        }
+        row.addView(join, LinearLayout.LayoutParams(0, dp(48), 1f))
+        row.addView(cancel, LinearLayout.LayoutParams(0, dp(48), 1f).apply { leftMargin = dp(10) })
+        panel.addView(row, matchWrap(top = 12))
+        return panel
+    }
+
+    private fun renderJoinGroupForm() {
+        if (!::groupContent.isInitialized) return
+        groupContent.removeAllViews()
+        groupContent.addView(joinGroupPanel(collapsed = false), matchWrapNoMargin())
     }
 
     private fun groupRiderListView(groupCode: String): TextView {
@@ -578,6 +625,17 @@ class MainActivity : Activity(), RideBus.Listener {
         stopRide()
     }
 
+    private fun openActiveGroupFromMap() {
+        val activeCode = currentState.rideId.takeIf { it.isNotBlank() }
+            ?: prefs.getString(KEY_ACTIVE_GROUP_CODE, null)
+            ?: return
+        val group = loadGroups().firstOrNull { it.code == activeCode } ?: LocalGroup(activeCode, groupNameForCode(activeCode)).also {
+            saveGroup(it)
+        }
+        switchTab("group")
+        renderGroupDetail(group.code)
+    }
+
     private fun stopRide() {
         val intent = Intent(this, LiveLocationService::class.java)
             .setAction(LiveLocationService.ACTION_STOP)
@@ -597,7 +655,6 @@ class MainActivity : Activity(), RideBus.Listener {
         updateMapOverlays(state)
         updateGroupTab(state)
         highlightMode(state.updateMode)
-        playNewSosTone(state.groupAlert)
     }
 
     private fun updateMapOverlays(state: RideState) {
@@ -639,6 +696,7 @@ class MainActivity : Activity(), RideBus.Listener {
         mapPage.visibility = if (tab == "map") View.VISIBLE else View.GONE
         groupPage.visibility = if (tab == "group") View.VISIBLE else View.GONE
         profilePage.visibility = if (tab == "profile") View.VISIBLE else View.GONE
+        topBar.visibility = if (tab == "map") View.GONE else View.VISIBLE
         pageTitle.text = when (tab) {
             "group" -> "Group"
             "profile" -> "Profile"
@@ -673,18 +731,6 @@ class MainActivity : Activity(), RideBus.Listener {
         bottomProfileTab.setTextColor(if (selectedTab == "profile") BLUE else MUTED)
     }
 
-    private fun playNewSosTone(alert: GroupAlert?) {
-        val timestamp = alert?.timestampMs ?: return
-        if (timestamp <= ignoreExistingSosBeforeMs || timestamp <= lastSosToneTimestampMs) return
-        lastSosToneTimestampMs = timestamp
-
-        val tone = sosTone ?: ToneGenerator(AudioManager.STREAM_ALARM, 100).also { sosTone = it }
-        tone.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 1200)
-        livePill.postDelayed({
-            sosTone?.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 1200)
-        }, 1400L)
-    }
-
     private fun saveProfile() {
         prefs.edit()
             .putString(KEY_RIDER_NAME, profileNameInput.text.toString().trim())
@@ -707,7 +753,7 @@ class MainActivity : Activity(), RideBus.Listener {
             ?: selectedGroupCode
             ?: prefs.getString(KEY_ACTIVE_GROUP_CODE, null)
             ?: rideCodeInput.text.toString().trim().uppercase(Locale.US).ifBlank { "MORNING-RIDE" }
-        val joinLink = inviteUri(rideCode).toString()
+        val joinLink = inviteLink(rideCode)
         prefs.edit()
             .putString(KEY_RIDE_CODE, rideCode)
             .apply()
@@ -716,9 +762,9 @@ class MainActivity : Activity(), RideBus.Listener {
             Join my CoRider group.
 
             Ride code: $rideCode
-            Tap to join: $joinLink
+            $joinLink
 
-            If the link does not open directly, open CoRider and enter the ride code above.
+            If the link opens in browser, tap Open CoRider. If needed, open CoRider > Group > Join Group and enter the ride code.
         """.trimIndent()
 
         val intent = Intent(Intent.ACTION_SEND).apply {
@@ -746,14 +792,24 @@ class MainActivity : Activity(), RideBus.Listener {
         return code?.trim()?.uppercase(Locale.US)?.takeIf { it.isNotBlank() }
     }
 
-    private fun inviteUri(rideCode: String): Uri {
+    private fun deepLinkUri(rideCode: String): Uri {
         return Uri.Builder()
-            .scheme("https")
-            .authority(INVITE_HOST)
-            .path("join")
+            .scheme("corider")
+            .authority("join")
             .appendQueryParameter("ride", rideCode)
             .appendQueryParameter("name", groupNameForCode(rideCode))
             .build()
+    }
+
+    private fun inviteLink(rideCode: String): String {
+        return Uri.Builder()
+            .scheme("https")
+            .authority(INVITE_HOST)
+            .path(INVITE_PATH)
+            .appendQueryParameter("ride", rideCode)
+            .appendQueryParameter("name", groupNameForCode(rideCode))
+            .build()
+            .toString()
     }
 
     private fun loadGroups(): List<LocalGroup> {
@@ -868,9 +924,13 @@ class MainActivity : Activity(), RideBus.Listener {
     private fun bigActionButton(textValue: String, fill: Int, stroke: Int): Button {
         return Button(this).apply {
             text = textValue
-            textSize = 18f
+            textSize = 16f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
+            setSingleLine(true)
+            maxLines = 1
+            includeFontPadding = false
+            setPadding(0, 0, 0, 0)
             background = rounded(fill, dp(13), stroke = stroke, strokeWidth = 2)
             isAllCaps = false
         }
@@ -1070,7 +1130,8 @@ class MainActivity : Activity(), RideBus.Listener {
         private const val KEY_BLOOD_GROUP = "blood_group"
         private const val KEY_BIKE = "bike"
         private const val KEY_EMERGENCY_CONTACT = "emergency_contact"
-        private const val INVITE_HOST = "corider-tracker.app"
+        private const val INVITE_HOST = "rahulsanapala.github.io"
+        private const val INVITE_PATH = "/corider-tracker/join.html"
 
         private val SURFACE = Color.rgb(4, 9, 16)
         private val TOP_BAR = Color.rgb(5, 11, 20)

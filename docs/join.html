@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Join CoRider Group</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Arial, sans-serif;
+      background: #040910;
+      color: #f8fafc;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+    main {
+      width: min(420px, 100%);
+      background: #0c1623;
+      border: 1px solid #243142;
+      border-radius: 12px;
+      padding: 22px;
+    }
+    h1 {
+      margin: 0 0 12px;
+      font-size: 22px;
+    }
+    p {
+      color: #cbd5e1;
+      line-height: 1.45;
+    }
+    a {
+      display: block;
+      margin-top: 18px;
+      padding: 14px 16px;
+      border-radius: 10px;
+      background: #4a92ff;
+      color: #fff;
+      text-align: center;
+      text-decoration: none;
+      font-weight: 700;
+    }
+    code {
+      display: block;
+      margin-top: 10px;
+      padding: 12px;
+      background: #0a111d;
+      border-radius: 8px;
+      color: #fff;
+      word-break: break-all;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Join CoRider Group</h1>
+    <p id="message">Opening CoRider...</p>
+    <code id="code"></code>
+    <a id="openApp" href="#">Open CoRider</a>
+  </main>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const ride = (params.get("ride") || params.get("code") || "").trim();
+    const name = (params.get("name") || "").trim();
+    const code = document.getElementById("code");
+    const message = document.getElementById("message");
+    const openApp = document.getElementById("openApp");
+
+    if (!ride) {
+      message.textContent = "No group code was found in this invite.";
+      code.textContent = "Ask the rider to share the group code again.";
+      openApp.style.display = "none";
+    } else {
+      const deepLink = "corider://join?ride=" + encodeURIComponent(ride) +
+        (name ? "&name=" + encodeURIComponent(name) : "");
+      message.textContent = "Group code";
+      code.textContent = ride;
+      openApp.href = deepLink;
+      setTimeout(() => {
+        window.location.href = deepLink;
+      }, 250);
+    }
+  </script>
+</body>
+</html>

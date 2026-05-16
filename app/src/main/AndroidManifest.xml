@@ -30,13 +30,13 @@
                     android:host="join"
                     android:scheme="corider" />
             </intent-filter>
-            <intent-filter>
+            <intent-filter android:autoVerify="true">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data
-                    android:host="corider-tracker.app"
-                    android:pathPrefix="/join"
+                    android:host="rahulsanapala.github.io"
+                    android:pathPrefix="/corider-tracker/join.html"
                     android:scheme="https" />
             </intent-filter>
         </activity>
