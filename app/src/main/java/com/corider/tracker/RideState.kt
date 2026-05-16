@@ -14,6 +14,7 @@ data class RideState(
     val riders: Map<String, RiderSnapshot> = emptyMap(),
     val groupAlert: GroupAlert? = null,
     val regroupPoint: RegroupPoint? = null,
+    val safetyCheck: SafetyCheck? = null,
     val updateMode: UpdateMode = UpdateMode.NORMAL
 )
 
@@ -35,6 +36,17 @@ data class RegroupPoint(
     val longitude: Double get() = lonE7 / 10_000_000.0
 }
 
+data class SafetyCheck(
+    val id: String,
+    val targetRiderId: String,
+    val targetRiderName: String,
+    val gapM: Int,
+    val createdAtMs: Long,
+    val dueAtMs: Long,
+    val status: String,
+    val acknowledgedAtMs: Long = 0L
+)
+
 enum class UpdateMode { ECO, NORMAL, FAST }
 
 data class RiderSnapshot(
@@ -45,7 +57,8 @@ data class RiderSnapshot(
     val speedCentiMps: Int,
     val bearingDeg: Int,
     val accuracyM: Int,
-    val updatedAtMs: Long
+    val updatedAtMs: Long,
+    val stationarySinceMs: Long = 0L
 ) {
     val latitude: Double get() = latE7 / 10_000_000.0
     val longitude: Double get() = lonE7 / 10_000_000.0
@@ -77,13 +90,19 @@ data class RiderSnapshot(
         private const val METERS_PER_LAT_DEGREE = 110_540.0
         private const val METERS_PER_LON_DEGREE_AT_EQUATOR = 111_320.0
 
-        fun fromLocation(id: String, name: String, location: Location, nowMs: Long): RiderSnapshot {
+        fun fromLocation(
+            id: String,
+            name: String,
+            location: Location,
+            nowMs: Long,
+            stationarySinceMs: Long = 0L
+        ): RiderSnapshot {
             val lat = (location.latitude * 10_000_000).roundToInt()
             val lon = (location.longitude * 10_000_000).roundToInt()
             val speed = if (location.hasSpeed()) (location.speed * 100f).roundToInt() else 0
             val bearing = if (location.hasBearing()) location.bearing.roundToInt() else -1
             val accuracy = if (location.hasAccuracy()) location.accuracy.roundToInt() else -1
-            return RiderSnapshot(id, name, lat, lon, speed, bearing, accuracy, nowMs)
+            return RiderSnapshot(id, name, lat, lon, speed, bearing, accuracy, nowMs, stationarySinceMs)
         }
     }
 }

@@ -12,13 +12,16 @@ import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import com.corider.tracker.MainActivity
 import com.corider.tracker.R
 import com.corider.tracker.RideBus
 import com.corider.tracker.RiderSnapshot
 import com.corider.tracker.GroupAlert
 import com.corider.tracker.RegroupPoint
+import com.corider.tracker.SafetyCheck
 import com.corider.tracker.UpdateMode
 import com.google.firebase.database.ChildEventListener
 import com.google.firebase.database.DataSnapshot
@@ -43,6 +46,12 @@ class LiveLocationService : Service(), LocationListener {
     private var alertListener: ValueEventListener? = null
     private var regroupListener: ValueEventListener? = null
     private var modeListener: ValueEventListener? = null
+    private var safetyListener: ValueEventListener? = null
+    private var safetyRiders = LinkedHashMap<String, RiderSnapshot>()
+    private var localStationarySinceMs = 0L
+    private var lastPublishedSafetyCheckId = ""
+    private var lastNotifiedSafetyCheckId = ""
+    private val handler = Handler(Looper.getMainLooper())
 
     override fun onCreate() {
         super.onCreate()
@@ -58,6 +67,8 @@ class LiveLocationService : Service(), LocationListener {
             }
             ACTION_SOS -> publishSos()
             ACTION_REGROUP -> publishRegroup()
+            ACTION_CLEAR_REGROUP -> clearRegroup()
+            ACTION_ACK_SAFETY -> acknowledgeSafety(intent.getStringExtra(EXTRA_SAFETY_CHECK_ID).orEmpty())
             ACTION_SET_MODE -> {
                 val mode = intent.getStringExtra(EXTRA_MODE).orEmpty()
                 setMode(mode)
@@ -75,9 +86,12 @@ class LiveLocationService : Service(), LocationListener {
 
     override fun onLocationChanged(location: Location) {
         val now = System.currentTimeMillis()
-        val snapshot = RiderSnapshot.fromLocation(riderId, riderName, location, now)
+        updateStationaryClock(location, now)
+        val snapshot = RiderSnapshot.fromLocation(riderId, riderName, location, now, localStationarySinceMs)
         lastOwnSnapshot = snapshot
+        safetyRiders[riderId] = snapshot
         RideBus.updateOwnLocation(snapshot)
+        evaluateSafetyCheck(now)
 
         if (!gate.shouldPublish(location, now)) return
         gate.markPublished(location, now)
@@ -117,6 +131,10 @@ class LiveLocationService : Service(), LocationListener {
         stopTracking(sendLeave = false)
         running = true
         publishExecutor = Executors.newSingleThreadExecutor()
+        safetyRiders = LinkedHashMap()
+        localStationarySinceMs = 0L
+        lastPublishedSafetyCheckId = ""
+        lastNotifiedSafetyCheckId = ""
 
         startForeground(NOTIFICATION_ID, buildNotification())
         RideBus.setRide(rideId, riderId, riderName)
@@ -151,15 +169,24 @@ class LiveLocationService : Service(), LocationListener {
         val listenersRef = FirebaseDatabase.getInstance().getReference(rideRefPath)
         riderEventsListener = object : ChildEventListener {
             override fun onChildAdded(snapshot: DataSnapshot, previousChildName: String?) {
-                readRiderSnapshot(snapshot)?.let { if (it.id != riderId) RideBus.updateRider(it) }
+                readRiderSnapshot(snapshot)?.let {
+                    safetyRiders[it.id] = it
+                    if (it.id != riderId) RideBus.updateRider(it)
+                    evaluateSafetyCheck(System.currentTimeMillis())
+                }
             }
 
             override fun onChildChanged(snapshot: DataSnapshot, previousChildName: String?) {
-                readRiderSnapshot(snapshot)?.let { if (it.id != riderId) RideBus.updateRider(it) }
+                readRiderSnapshot(snapshot)?.let {
+                    safetyRiders[it.id] = it
+                    if (it.id != riderId) RideBus.updateRider(it)
+                    evaluateSafetyCheck(System.currentTimeMillis())
+                }
             }
 
             override fun onChildRemoved(snapshot: DataSnapshot) {
                 val id = snapshot.key ?: return
+                safetyRiders.remove(id)
                 RideBus.removeRider(id)
             }
 
@@ -181,6 +208,7 @@ class LiveLocationService : Service(), LocationListener {
             locationManager.removeUpdates(this)
         } catch (_: Exception) {
         }
+        handler.removeCallbacksAndMessages(null)
         val ridersRef = if (rideRefPath.isNotBlank()) FirebaseDatabase.getInstance().getReference(rideRefPath) else null
         riderEventsListener?.let { listener ->
             ridersRef?.removeEventListener(listener)
@@ -219,6 +247,7 @@ class LiveLocationService : Service(), LocationListener {
             NotificationManager.IMPORTANCE_LOW
         )
         manager.createNotificationChannel(channel)
+        ensureSafetyNotificationChannel(manager)
 
         val contentIntent = PendingIntent.getActivity(
             this,
@@ -236,6 +265,17 @@ class LiveLocationService : Service(), LocationListener {
             .build()
     }
 
+    private fun ensureSafetyNotificationChannel(manager: NotificationManager) {
+        val channel = NotificationChannel(
+            SAFETY_CHANNEL_ID,
+            "Ride safety alerts",
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = "Group safety checks and automatic SOS escalation"
+        }
+        manager.createNotificationChannel(channel)
+    }
+
     companion object {
         const val ACTION_START = "com.corider.tracker.START"
         const val ACTION_STOP = "com.corider.tracker.STOP"
@@ -244,13 +284,22 @@ class LiveLocationService : Service(), LocationListener {
         const val EXTRA_RIDER_NAME = "rider_name"
         const val ACTION_SOS = "com.corider.tracker.SOS"
         const val ACTION_REGROUP = "com.corider.tracker.REGROUP"
+        const val ACTION_CLEAR_REGROUP = "com.corider.tracker.CLEAR_REGROUP"
+        const val ACTION_ACK_SAFETY = "com.corider.tracker.ACK_SAFETY"
         const val ACTION_SET_MODE = "com.corider.tracker.SET_MODE"
         const val EXTRA_MODE = "update_mode"
+        const val EXTRA_SAFETY_CHECK_ID = "safety_check_id"
 
         private const val CHANNEL_ID = "ride_tracking"
+        private const val SAFETY_CHANNEL_ID = "ride_safety"
         private const val NOTIFICATION_ID = 701
-        private const val SAMPLE_INTERVAL_MS = 2_000L
-        private const val SAMPLE_DISTANCE_M = 3f
+        private const val SAFETY_NOTIFICATION_ID = 702
+        private const val SAMPLE_INTERVAL_MS = 3_000L
+        private const val SAMPLE_DISTANCE_M = 5f
+        private const val STATIONARY_SPEED_MPS = 0.8
+        private const val STATIONARY_REQUIRED_MS = 10 * 60 * 1000L
+        private const val ACK_TIMEOUT_MS = 5 * 60 * 1000L
+        private const val GAP_REQUIRED_M = 2_000
     }
 
     private fun startGroupEventListeners() {
@@ -267,6 +316,10 @@ class LiveLocationService : Service(), LocationListener {
         }
         regroupListener = object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
+                if (!snapshot.exists()) {
+                    RideBus.setRegroupPoint(null)
+                    return
+                }
                 val id = snapshot.child("riderId").getValue(String::class.java) ?: return
                 val name = snapshot.child("riderName").getValue(String::class.java) ?: "Rider"
                 val lat = snapshot.child("latE7").getValue(Int::class.java) ?: return
@@ -279,13 +332,29 @@ class LiveLocationService : Service(), LocationListener {
         modeListener = object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
                 val value = snapshot.getValue(String::class.java) ?: "NORMAL"
-                RideBus.setUpdateMode(runCatching { UpdateMode.valueOf(value) }.getOrDefault(UpdateMode.NORMAL))
+                val mode = runCatching { UpdateMode.valueOf(value) }.getOrDefault(UpdateMode.NORMAL)
+                gate.setMode(mode)
+                RideBus.setUpdateMode(mode)
+            }
+            override fun onCancelled(error: DatabaseError) = Unit
+        }
+        safetyListener = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                if (!snapshot.exists()) {
+                    RideBus.setSafetyCheck(null)
+                    return
+                }
+                val check = readSafetyCheck(snapshot) ?: return
+                RideBus.setSafetyCheck(check)
+                notifySafetyCheck(check)
+                scheduleSafetyEscalation(check)
             }
             override fun onCancelled(error: DatabaseError) = Unit
         }
         root.child("events").child("sos").addValueEventListener(alertListener as ValueEventListener)
         root.child("events").child("regroup").addValueEventListener(regroupListener as ValueEventListener)
         root.child("settings").child("mode").addValueEventListener(modeListener as ValueEventListener)
+        root.child("events").child("safetyCheck").addValueEventListener(safetyListener as ValueEventListener)
     }
 
     private fun removeGroupEventListeners() {
@@ -294,9 +363,11 @@ class LiveLocationService : Service(), LocationListener {
         alertListener?.let { root.child("events").child("sos").removeEventListener(it) }
         regroupListener?.let { root.child("events").child("regroup").removeEventListener(it) }
         modeListener?.let { root.child("settings").child("mode").removeEventListener(it) }
+        safetyListener?.let { root.child("events").child("safetyCheck").removeEventListener(it) }
         alertListener = null
         regroupListener = null
         modeListener = null
+        safetyListener = null
     }
 
     private fun publishSnapshot(snapshot: RiderSnapshot) {
@@ -308,7 +379,8 @@ class LiveLocationService : Service(), LocationListener {
             "speedCentiMps" to snapshot.speedCentiMps,
             "bearingDeg" to snapshot.bearingDeg,
             "accuracyM" to snapshot.accuracyM,
-            "updatedAtMs" to snapshot.updatedAtMs
+            "updatedAtMs" to snapshot.updatedAtMs,
+            "stationarySinceMs" to snapshot.stationarySinceMs
         )
         FirebaseDatabase.getInstance()
             .getReference(rideRefPath)
@@ -318,10 +390,15 @@ class LiveLocationService : Service(), LocationListener {
 
     private fun publishSos() {
         if (rideRootPath.isBlank()) return
+        publishSosFor(riderId, riderName, "SOS")
+    }
+
+    private fun publishSosFor(alertRiderId: String, alertRiderName: String, message: String) {
+        if (rideRootPath.isBlank()) return
         val payload = mapOf(
-            "riderId" to riderId,
-            "riderName" to riderName,
-            "message" to "SOS",
+            "riderId" to alertRiderId,
+            "riderName" to alertRiderName,
+            "message" to message,
             "timestampMs" to System.currentTimeMillis()
         )
         FirebaseDatabase.getInstance().getReference(rideRootPath).child("events").child("sos").setValue(payload)
@@ -339,8 +416,175 @@ class LiveLocationService : Service(), LocationListener {
         FirebaseDatabase.getInstance().getReference(rideRootPath).child("events").child("regroup").setValue(payload)
     }
 
+    private fun clearRegroup() {
+        if (rideRootPath.isBlank()) return
+        FirebaseDatabase.getInstance().getReference(rideRootPath).child("events").child("regroup").removeValue()
+        RideBus.setRegroupPoint(null)
+    }
+
+    private fun updateStationaryClock(location: Location, nowMs: Long) {
+        val speedMps = if (location.hasSpeed()) location.speed.toDouble() else 0.0
+        localStationarySinceMs = if (speedMps > STATIONARY_SPEED_MPS) {
+            0L
+        } else {
+            localStationarySinceMs.takeIf { it > 0L } ?: nowMs
+        }
+    }
+
+    private fun evaluateSafetyCheck(nowMs: Long) {
+        if (!running || rideRootPath.isBlank()) return
+        val ranked = rankedRiders(nowMs)
+        if (ranked.size < 2) return
+
+        val first = ranked.first()
+        val last = ranked.last()
+        val gapM = first.distanceTo(last).toInt()
+        val stoppedLongEnough = last.stationarySinceMs > 0L &&
+            nowMs - last.stationarySinceMs >= STATIONARY_REQUIRED_MS
+        if (gapM < GAP_REQUIRED_M || !stoppedLongEnough) return
+
+        val checkId = "${last.id}-${last.stationarySinceMs}"
+        if (checkId == lastPublishedSafetyCheckId) return
+        lastPublishedSafetyCheckId = checkId
+
+        val payload = mapOf(
+            "id" to checkId,
+            "targetRiderId" to last.id,
+            "targetRiderName" to last.label,
+            "firstRiderId" to first.id,
+            "firstRiderName" to first.label,
+            "gapM" to gapM,
+            "createdAtMs" to nowMs,
+            "dueAtMs" to nowMs + ACK_TIMEOUT_MS,
+            "status" to "pending",
+            "acknowledgedAtMs" to 0L
+        )
+        FirebaseDatabase.getInstance()
+            .getReference(rideRootPath)
+            .child("events")
+            .child("safetyCheck")
+            .setValue(payload)
+    }
+
+    private fun rankedRiders(nowMs: Long): List<RiderSnapshot> {
+        val riders = safetyRiders.values.filter { !it.isStale(nowMs) }
+        if (riders.size < 2) return riders
+
+        val movingBearing = riders
+            .filter { it.bearingDeg in 0..359 && it.speedMps > STATIONARY_SPEED_MPS }
+            .map { Math.toRadians(it.bearingDeg.toDouble()) }
+
+        if (movingBearing.isEmpty()) {
+            val pair = riders.flatMapIndexed { index, a ->
+                riders.drop(index + 1).map { b -> Triple(a, b, a.distanceTo(b)) }
+            }.maxByOrNull { it.third } ?: return riders
+            return listOf(pair.first, pair.second)
+        }
+
+        val x = movingBearing.sumOf { kotlin.math.sin(it) } / movingBearing.size
+        val y = movingBearing.sumOf { kotlin.math.cos(it) } / movingBearing.size
+        val origin = riders.first()
+        return riders.sortedByDescending { rider ->
+            val (eastM, northM) = rider.offsetMetersFrom(origin)
+            eastM * x + northM * y
+        }
+    }
+
+    private fun readSafetyCheck(snapshot: DataSnapshot): SafetyCheck? {
+        val id = snapshot.child("id").getValue(String::class.java) ?: return null
+        val targetId = snapshot.child("targetRiderId").getValue(String::class.java) ?: return null
+        val targetName = snapshot.child("targetRiderName").getValue(String::class.java) ?: "Rider"
+        val gapM = snapshot.child("gapM").getValue(Int::class.java) ?: 0
+        val createdAt = snapshot.child("createdAtMs").getValue(Long::class.java) ?: 0L
+        val dueAt = snapshot.child("dueAtMs").getValue(Long::class.java) ?: 0L
+        val status = snapshot.child("status").getValue(String::class.java) ?: "pending"
+        val acknowledgedAt = snapshot.child("acknowledgedAtMs").getValue(Long::class.java) ?: 0L
+        return SafetyCheck(id, targetId, targetName, gapM, createdAt, dueAt, status, acknowledgedAt)
+    }
+
+    private fun notifySafetyCheck(check: SafetyCheck) {
+        if (check.status != "pending" || check.id == lastNotifiedSafetyCheckId) return
+        lastNotifiedSafetyCheckId = check.id
+
+        val manager = getSystemService(NotificationManager::class.java)
+        ensureSafetyNotificationChannel(manager)
+
+        val openIntent = PendingIntent.getActivity(
+            this,
+            SAFETY_NOTIFICATION_ID,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val builder = Notification.Builder(this, SAFETY_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_ride_notification)
+            .setContentTitle("Rider safety check")
+            .setContentText("${check.targetRiderName} is ${check.gapM} m behind and not moving")
+            .setContentIntent(openIntent)
+            .setAutoCancel(true)
+
+        if (check.targetRiderId == riderId) {
+            val ackIntent = PendingIntent.getService(
+                this,
+                SAFETY_NOTIFICATION_ID + 1,
+                Intent(this, LiveLocationService::class.java)
+                    .setAction(ACTION_ACK_SAFETY)
+                    .putExtra(EXTRA_SAFETY_CHECK_ID, check.id),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            builder.addAction(R.drawable.ic_ride_notification, "I am OK", ackIntent)
+        }
+
+        manager.notify(SAFETY_NOTIFICATION_ID, builder.build())
+    }
+
+    private fun scheduleSafetyEscalation(check: SafetyCheck) {
+        if (check.status != "pending") return
+        val delayMs = (check.dueAtMs - System.currentTimeMillis()).coerceAtLeast(0L)
+        handler.postDelayed({ verifyAndEscalateSafety(check.id) }, delayMs)
+    }
+
+    private fun acknowledgeSafety(checkId: String) {
+        if (rideRootPath.isBlank() || checkId.isBlank()) return
+        FirebaseDatabase.getInstance()
+            .getReference(rideRootPath)
+            .child("events")
+            .child("safetyCheck")
+            .updateChildren(
+                mapOf(
+                    "status" to "acknowledged",
+                    "acknowledgedAtMs" to System.currentTimeMillis(),
+                    "acknowledgedByRiderId" to riderId,
+                    "acknowledgedByRiderName" to riderName
+                )
+            )
+        RideBus.setStatus("Safety check acknowledged")
+    }
+
+    private fun verifyAndEscalateSafety(checkId: String) {
+        if (rideRootPath.isBlank() || checkId.isBlank()) return
+        val checkRef = FirebaseDatabase.getInstance()
+            .getReference(rideRootPath)
+            .child("events")
+            .child("safetyCheck")
+        checkRef.get().addOnSuccessListener { snapshot ->
+            val check = readSafetyCheck(snapshot) ?: return@addOnSuccessListener
+            if (check.id != checkId || check.status != "pending" || System.currentTimeMillis() < check.dueAtMs) {
+                return@addOnSuccessListener
+            }
+            checkRef.updateChildren(
+                mapOf(
+                    "status" to "escalated",
+                    "escalatedAtMs" to System.currentTimeMillis()
+                )
+            )
+            publishSosFor(check.targetRiderId, check.targetRiderName, "Auto SOS: no safety acknowledgement")
+        }
+    }
+
     private fun setMode(modeText: String) {
         val mode = runCatching { UpdateMode.valueOf(modeText) }.getOrDefault(UpdateMode.NORMAL)
+        gate.setMode(mode)
         FirebaseDatabase.getInstance().getReference(rideRootPath).child("settings").child("mode").setValue(mode.name)
         RideBus.setUpdateMode(mode)
     }
@@ -354,6 +598,7 @@ class LiveLocationService : Service(), LocationListener {
         val bearing = snapshot.child("bearingDeg").getValue(Int::class.java) ?: -1
         val accuracy = snapshot.child("accuracyM").getValue(Int::class.java) ?: -1
         val updatedAt = snapshot.child("updatedAtMs").getValue(Long::class.java) ?: System.currentTimeMillis()
-        return RiderSnapshot(id, name, latE7, lonE7, speed, bearing, accuracy, updatedAt)
+        val stationarySince = snapshot.child("stationarySinceMs").getValue(Long::class.java) ?: 0L
+        return RiderSnapshot(id, name, latE7, lonE7, speed, bearing, accuracy, updatedAt, stationarySince)
     }
 }

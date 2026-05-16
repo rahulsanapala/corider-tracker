@@ -75,6 +75,10 @@ object RideBus {
         update { it.copy(regroupPoint = point) }
     }
 
+    fun setSafetyCheck(check: SafetyCheck?) {
+        update { it.copy(safetyCheck = check) }
+    }
+
     fun setUpdateMode(mode: UpdateMode) {
         update { it.copy(updateMode = mode) }
     }

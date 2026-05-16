@@ -3,6 +3,7 @@ package com.corider.tracker.ui
 import android.content.Context
 import android.os.SystemClock
 import android.widget.FrameLayout
+import com.corider.tracker.RegroupPoint
 import com.corider.tracker.RideState
 import com.corider.tracker.RiderSnapshot
 import org.osmdroid.config.Configuration
@@ -20,6 +21,7 @@ class LiveMapView(context: Context) : FrameLayout(context) {
     private val riderTrails = LinkedHashMap<String, Polyline>()
     private val trailPoints = LinkedHashMap<String, ArrayDeque<GeoPoint>>()
     private var ownMarker: Marker? = null
+    private var regroupMarker: Marker? = null
     private var accuracyCircle: Polygon? = null
     private var state = RideState()
     private var followOwnLocation = true
@@ -50,7 +52,7 @@ class LiveMapView(context: Context) : FrameLayout(context) {
 
     fun centerOnMe() {
         followOwnLocation = true
-        state.ownLocation?.let { moveCamera(it) }
+        state.ownLocation?.let { moveCamera(it, zoomToTrackingLevel = true) }
     }
 
     private fun render() {
@@ -91,7 +93,26 @@ class LiveMapView(context: Context) : FrameLayout(context) {
             )
             updateTrail(rider.id, rider.toGeoPoint())
         }
+        updateRegroupMarker(state.regroupPoint)
         mapView.invalidate()
+    }
+
+    private fun updateRegroupMarker(point: RegroupPoint?) {
+        if (point == null) {
+            regroupMarker?.let { mapView.overlays.remove(it) }
+            regroupMarker = null
+            return
+        }
+
+        val position = GeoPoint(point.latitude, point.longitude)
+        val marker = regroupMarker ?: Marker(mapView).also {
+            it.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+            mapView.overlays.add(it)
+            regroupMarker = it
+        }
+        marker.position = position
+        marker.title = "Regroup point"
+        marker.subDescription = "Set by ${point.riderName}"
     }
 
     private fun updateAccuracyCircle(own: RiderSnapshot) {
@@ -106,7 +127,10 @@ class LiveMapView(context: Context) : FrameLayout(context) {
         mapView.overlays.add(accuracyCircle)
     }
 
-    private fun moveCamera(snapshot: RiderSnapshot) {
+    private fun moveCamera(snapshot: RiderSnapshot, zoomToTrackingLevel: Boolean = false) {
+        if (zoomToTrackingLevel) {
+            mapView.controller.setZoom(TRACKING_ZOOM)
+        }
         mapView.controller.animateTo(snapshot.toGeoPoint())
     }
 
@@ -202,5 +226,6 @@ class LiveMapView(context: Context) : FrameLayout(context) {
     companion object {
         private const val MAX_TRAIL_POINTS = 30
         private const val MIN_TRAIL_POINT_DISTANCE_M = 4.0
+        private const val TRACKING_ZOOM = 16.0
     }
 }
