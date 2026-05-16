@@ -47,6 +47,13 @@ object RideBus {
         update { it.copy(ownLocation = snapshot) }
     }
 
+    fun updateRiderName(riderName: String) {
+        update { current ->
+            val own = current.ownLocation?.copy(name = riderName)
+            current.copy(riderName = riderName, ownLocation = own)
+        }
+    }
+
     fun updateRider(snapshot: RiderSnapshot) {
         update { current ->
             if (snapshot.id == current.riderId) {
@@ -85,15 +92,9 @@ object RideBus {
 
     private fun update(block: (RideState) -> RideState) {
         val next = synchronized(this) {
-            state = block(state).dropStaleRiders()
+            state = block(state)
             state
         }
         listeners.forEach { it.onRideStateChanged(next) }
-    }
-
-    private fun RideState.dropStaleRiders(): RideState {
-        val now = System.currentTimeMillis()
-        val fresh = riders.filterValues { !it.isStale(now) }
-        return if (fresh.size == riders.size) this else copy(riders = fresh)
     }
 }

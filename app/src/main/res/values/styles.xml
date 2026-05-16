@@ -1,11 +1,45 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+    <style name="AppTheme" parent="Theme.MaterialComponents.DayNight.NoActionBar">
         <item name="android:fontFamily">sans</item>
-        <item name="android:windowLightStatusBar">true</item>
-        <item name="android:statusBarColor">#F7F8FA</item>
-        <item name="android:navigationBarColor">#F7F8FA</item>
+        <item name="fontFamily">sans</item>
+        <item name="colorPrimary">#4C8DFF</item>
+        <item name="colorPrimaryVariant">#10233E</item>
+        <item name="colorSecondary">#34D399</item>
+        <item name="colorSecondaryVariant">#075B32</item>
+        <item name="colorSurface">#121418</item>
+        <item name="colorOnSurface">#FFFFFF</item>
+        <item name="colorError">#EF4444</item>
+        <item name="materialButtonStyle">@style/CoRiderButton</item>
+        <item name="shapeAppearanceSmallComponent">@style/CoRiderShapeSmall</item>
+        <item name="shapeAppearanceMediumComponent">@style/CoRiderShapeMedium</item>
+        <item name="shapeAppearanceLargeComponent">@style/CoRiderShapeLarge</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:statusBarColor">#05070C</item>
+        <item name="android:navigationBarColor">#05070C</item>
         <item name="android:windowActionModeOverlay">true</item>
     </style>
-</resources>
 
+    <style name="CoRiderButton" parent="Widget.MaterialComponents.Button">
+        <item name="android:textAllCaps">false</item>
+        <item name="cornerRadius">12dp</item>
+        <item name="iconGravity">textStart</item>
+        <item name="rippleColor">#334C8DFF</item>
+    </style>
+
+    <style name="CoRiderShapeSmall" parent="ShapeAppearance.MaterialComponents.SmallComponent">
+        <item name="cornerFamily">rounded</item>
+        <item name="cornerSize">10dp</item>
+    </style>
+
+    <style name="CoRiderShapeMedium" parent="ShapeAppearance.MaterialComponents.MediumComponent">
+        <item name="cornerFamily">rounded</item>
+        <item name="cornerSize">14dp</item>
+    </style>
+
+    <style name="CoRiderShapeLarge" parent="ShapeAppearance.MaterialComponents.LargeComponent">
+        <item name="cornerFamily">rounded</item>
+        <item name="cornerSize">18dp</item>
+    </style>
+</resources>

@@ -86,7 +86,7 @@ data class RiderSnapshot(
     }
 
     companion object {
-        private const val STALE_AFTER_MS = 90_000L
+        private const val STALE_AFTER_MS = 180_000L
         private const val METERS_PER_LAT_DEGREE = 110_540.0
         private const val METERS_PER_LON_DEGREE_AT_EQUATOR = 111_320.0
 

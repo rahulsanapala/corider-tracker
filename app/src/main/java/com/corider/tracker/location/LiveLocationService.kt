@@ -74,6 +74,7 @@ class LiveLocationService : Service(), LocationListener {
             ACTION_REGROUP -> publishRegroup()
             ACTION_CLEAR_REGROUP -> clearRegroup()
             ACTION_ACK_SAFETY -> acknowledgeSafety(intent.getStringExtra(EXTRA_SAFETY_CHECK_ID).orEmpty())
+            ACTION_UPDATE_RIDER_NAME -> updateRiderName(intent.getStringExtra(EXTRA_RIDER_NAME).orEmpty())
             ACTION_SET_MODE -> {
                 val mode = intent.getStringExtra(EXTRA_MODE).orEmpty()
                 setMode(mode)
@@ -299,6 +300,7 @@ class LiveLocationService : Service(), LocationListener {
         const val ACTION_CLEAR_REGROUP = "com.corider.tracker.CLEAR_REGROUP"
         const val ACTION_ACK_SAFETY = "com.corider.tracker.ACK_SAFETY"
         const val ACTION_SET_MODE = "com.corider.tracker.SET_MODE"
+        const val ACTION_UPDATE_RIDER_NAME = "com.corider.tracker.UPDATE_RIDER_NAME"
         const val EXTRA_MODE = "update_mode"
         const val EXTRA_SAFETY_CHECK_ID = "safety_check_id"
 
@@ -401,6 +403,29 @@ class LiveLocationService : Service(), LocationListener {
             .getReference(rideRefPath)
             .child(snapshot.id)
             .setValue(payload)
+    }
+
+    private fun updateRiderName(nextName: String) {
+        if (nextName.isBlank()) return
+        riderName = nextName
+        RideBus.updateRiderName(nextName)
+        val refreshedSnapshot = lastOwnSnapshot?.copy(name = nextName, updatedAtMs = System.currentTimeMillis())
+        refreshedSnapshot?.let {
+            lastOwnSnapshot = it
+            safetyRiders[riderId] = it
+            RideBus.updateOwnLocation(it)
+        }
+        if (!running || rideRefPath.isBlank() || riderId.isBlank()) return
+        publishExecutor?.execute {
+            runCatching {
+                val updates = mutableMapOf<String, Any>("name" to nextName)
+                refreshedSnapshot?.let { updates["updatedAtMs"] = it.updatedAtMs }
+                FirebaseDatabase.getInstance()
+                    .getReference(rideRefPath)
+                    .child(riderId)
+                    .updateChildren(updates)
+            }
+        }
     }
 
     private fun publishSos() {
