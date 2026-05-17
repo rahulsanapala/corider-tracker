@@ -1,12 +1,27 @@
 package com.corider.tracker.ui
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.Point
+import android.graphics.Typeface
+import android.graphics.drawable.BitmapDrawable
 import android.os.SystemClock
+import android.view.View
 import android.widget.FrameLayout
+import android.widget.ImageView
+import com.corider.tracker.GroupAlert
+import com.corider.tracker.R
 import com.corider.tracker.RegroupPoint
 import com.corider.tracker.RideState
 import com.corider.tracker.RiderSnapshot
 import org.osmdroid.config.Configuration
+import org.osmdroid.events.MapListener
+import org.osmdroid.events.ScrollEvent
+import org.osmdroid.events.ZoomEvent
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
@@ -14,18 +29,29 @@ import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polygon
 import org.osmdroid.views.overlay.Polyline
 import java.util.ArrayDeque
+import java.util.Locale
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.roundToInt
+import kotlin.math.sin
 
 class LiveMapView(context: Context) : FrameLayout(context) {
     private val mapView: MapView
+    private val sosArrow: ImageView
+    private val riderIconCache = LinkedHashMap<String, BitmapDrawable>()
     private val riderMarkers = LinkedHashMap<String, Marker>()
     private val riderTrails = LinkedHashMap<String, Polyline>()
     private val trailPoints = LinkedHashMap<String, ArrayDeque<GeoPoint>>()
     private var ownMarker: Marker? = null
     private var regroupMarker: Marker? = null
+    private var sosMarker: Marker? = null
+    private var temporaryRiderMarker: Marker? = null
+    private var temporaryRiderSnapshot: RiderSnapshot? = null
     private var accuracyCircle: Polygon? = null
     private var state = RideState()
     private var followOwnLocation = true
     private val interpolator = android.view.animation.AccelerateDecelerateInterpolator()
+    var onSosMarkerClick: ((GroupAlert) -> Unit)? = null
 
     init {
         Configuration.getInstance().userAgentValue = context.packageName
@@ -37,6 +63,28 @@ class LiveMapView(context: Context) : FrameLayout(context) {
             maxZoomLevel = 20.0
         }
         addView(mapView, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        sosArrow = ImageView(context).apply {
+            setImageResource(R.drawable.ic_sos_direction_arrow)
+            visibility = View.GONE
+            elevation = 16f
+            isClickable = true
+            setOnClickListener {
+                focusOnSos()
+                state.groupAlert?.let { onSosMarkerClick?.invoke(it) }
+            }
+        }
+        addView(sosArrow, LayoutParams(ARROW_SIZE_DP.dp(), ARROW_SIZE_DP.dp()))
+        mapView.addMapListener(object : MapListener {
+            override fun onScroll(event: ScrollEvent?): Boolean {
+                updateSosArrow()
+                return false
+            }
+
+            override fun onZoom(event: ZoomEvent?): Boolean {
+                updateSosArrow()
+                return false
+            }
+        })
     }
 
     fun onCreate() = Unit
@@ -62,6 +110,32 @@ class LiveMapView(context: Context) : FrameLayout(context) {
         return true
     }
 
+    fun showTemporaryRider(snapshot: RiderSnapshot) {
+        temporaryRiderSnapshot = snapshot
+        followOwnLocation = false
+        updateTemporaryRiderMarker(System.currentTimeMillis())
+        moveCamera(snapshot, zoomToTrackingLevel = true)
+        mapView.invalidate()
+    }
+
+    fun clearTemporaryRider() {
+        temporaryRiderSnapshot = null
+        temporaryRiderMarker?.let { mapView.overlays.remove(it) }
+        temporaryRiderMarker = null
+        mapView.invalidate()
+    }
+
+    fun focusOnSos(): Boolean {
+        val point = state.groupAlert?.let { sosGeoPoint(it) } ?: return false
+        followOwnLocation = false
+        if (mapView.zoomLevelDouble < TRACKING_ZOOM) {
+            mapView.controller.setZoom(TRACKING_ZOOM)
+        }
+        mapView.controller.animateTo(point)
+        post { updateSosArrow() }
+        return true
+    }
+
     private fun render() {
         val own = state.ownLocation
         val now = System.currentTimeMillis()
@@ -72,6 +146,9 @@ class LiveMapView(context: Context) : FrameLayout(context) {
                 position = own.toGeoPoint(),
                 title = "You",
                 snippet = own.snippet(now),
+                riderId = own.id,
+                riderName = own.label,
+                ownRider = true,
                 bearingDeg = own.bearingDeg
             )
             updateAccuracyCircle(own)
@@ -96,12 +173,65 @@ class LiveMapView(context: Context) : FrameLayout(context) {
                 position = rider.toGeoPoint(),
                 title = rider.label,
                 snippet = rider.snippet(now),
+                riderId = rider.id,
+                riderName = rider.label,
+                ownRider = false,
                 bearingDeg = rider.bearingDeg
             )
             updateTrail(rider.id, rider.toGeoPoint())
         }
+        if (temporaryRiderSnapshot?.id in visible.keys) {
+            clearTemporaryRider()
+        } else {
+            updateTemporaryRiderMarker(now)
+        }
         updateRegroupMarker(state.regroupPoint)
+        updateSosMarker(state.groupAlert)
+        post { updateSosArrow() }
         mapView.invalidate()
+    }
+
+    private fun updateTemporaryRiderMarker(nowMs: Long) {
+        val snapshot = temporaryRiderSnapshot
+        if (snapshot == null) {
+            temporaryRiderMarker?.let { mapView.overlays.remove(it) }
+            temporaryRiderMarker = null
+            return
+        }
+        temporaryRiderMarker = temporaryRiderMarker.updateOrCreate(
+            map = mapView,
+            position = snapshot.toGeoPoint(),
+            title = "${snapshot.label} last known",
+            snippet = snapshot.snippet(nowMs),
+            riderId = snapshot.id,
+            riderName = snapshot.label,
+            ownRider = false,
+            bearingDeg = snapshot.bearingDeg
+        )
+    }
+
+    private fun updateSosMarker(alert: GroupAlert?) {
+        val point = alert?.let { sosGeoPoint(it) }
+        if (alert == null || point == null) {
+            sosMarker?.let { mapView.overlays.remove(it) }
+            sosMarker = null
+            sosArrow.visibility = View.GONE
+            return
+        }
+
+        val marker = sosMarker ?: Marker(mapView).also {
+            it.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+            it.icon = sosPinDrawable()
+            mapView.overlays.add(it)
+            sosMarker = it
+        }
+        marker.position = point
+        marker.title = "SOS"
+        marker.subDescription = "${alert.riderName}: ${alert.message}"
+        marker.setOnMarkerClickListener { _, _ ->
+            onSosMarkerClick?.invoke(alert)
+            true
+        }
     }
 
     private fun updateRegroupMarker(point: RegroupPoint?) {
@@ -146,12 +276,17 @@ class LiveMapView(context: Context) : FrameLayout(context) {
         position: GeoPoint,
         title: String,
         snippet: String,
+        riderId: String,
+        riderName: String,
+        ownRider: Boolean,
         bearingDeg: Int
     ): Marker {
+        val icon = riderPinDrawable(riderId, riderName, ownRider)
         val existing = this
         if (existing != null) {
             animateMarker(existing, position, animationDurationMs(bearingDeg))
-            updateHeading(existing, bearingDeg)
+            existing.rotation = 0f
+            existing.icon = icon
             existing.title = title
             existing.subDescription = snippet
             return existing
@@ -160,14 +295,11 @@ class LiveMapView(context: Context) : FrameLayout(context) {
             this.position = position
             this.title = title
             this.subDescription = snippet
-            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-            updateHeading(this, bearingDeg)
+            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+            this.icon = icon
+            rotation = 0f
             map.overlays.add(this)
         }
-    }
-
-    private fun updateHeading(marker: Marker, bearingDeg: Int) {
-        marker.rotation = if (bearingDeg in 0..359) bearingDeg.toFloat() else 0f
     }
 
     private fun animationDurationMs(bearingDeg: Int): Long {
@@ -202,9 +334,165 @@ class LiveMapView(context: Context) : FrameLayout(context) {
 
     private fun RiderSnapshot.toGeoPoint(): GeoPoint = GeoPoint(latitude, longitude)
 
+    private fun sosGeoPoint(alert: GroupAlert): GeoPoint? {
+        val lat = alert.latE7
+        val lon = alert.lonE7
+        if (lat != null && lon != null) return GeoPoint(lat / 10_000_000.0, lon / 10_000_000.0)
+        state.ownLocation?.takeIf { it.id == alert.riderId }?.let { return it.toGeoPoint() }
+        return state.riders[alert.riderId]?.toGeoPoint()
+    }
+
     private fun RiderSnapshot.snippet(nowMs: Long): String {
         val speedKmh = (speedMps * 3.6).toInt()
         return "${ageSeconds(nowMs)}s ago - $speedKmh km/h - $accuracyM m accuracy"
+    }
+
+    private fun updateSosArrow() {
+        val point = state.groupAlert?.let { sosGeoPoint(it) }
+        val parentWidth = width
+        val parentHeight = height
+        if (point == null || parentWidth <= 0 || parentHeight <= 0) {
+            sosArrow.visibility = View.GONE
+            return
+        }
+
+        val screen = mapView.projection.toPixels(point, Point())
+        val margin = EDGE_ARROW_MARGIN_DP.dp()
+        val onScreen = screen.x in margin..(parentWidth - margin) && screen.y in margin..(parentHeight - margin)
+        if (onScreen) {
+            sosArrow.visibility = View.GONE
+            return
+        }
+
+        val centerX = parentWidth / 2f
+        val centerY = parentHeight / 2f
+        val dx = screen.x - centerX
+        val dy = screen.y - centerY
+        val angle = atan2(dy, dx)
+        val size = ARROW_SIZE_DP.dp()
+        val minX = margin / 2
+        val minY = margin / 2
+        val maxX = parentWidth - size - margin / 2
+        val maxY = parentHeight - size - margin / 2
+        if (maxX < minX || maxY < minY) {
+            sosArrow.visibility = View.GONE
+            return
+        }
+
+        val edgeX = centerX + cos(angle) * (parentWidth / 2f - margin)
+        val edgeY = centerY + sin(angle) * (parentHeight / 2f - margin)
+        val params = (sosArrow.layoutParams as LayoutParams).apply {
+            leftMargin = (edgeX.roundToInt() - size / 2).coerceIn(minX, maxX)
+            topMargin = (edgeY.roundToInt() - size / 2).coerceIn(minY, maxY)
+        }
+        sosArrow.layoutParams = params
+        sosArrow.rotation = Math.toDegrees(angle.toDouble()).toFloat() + 90f
+        sosArrow.visibility = View.VISIBLE
+    }
+
+    private fun sosPinDrawable(): BitmapDrawable {
+        val size = SOS_PIN_SIZE_DP.dp()
+        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        val cx = size / 2f
+        val headCy = size * 0.34f
+        val headR = size * 0.29f
+
+        paint.color = Color.rgb(220, 38, 38)
+        val pin = Path().apply {
+            moveTo(cx, size - 3f)
+            cubicTo(size * 0.17f, size * 0.58f, size * 0.12f, size * 0.2f, cx, size * 0.05f)
+            cubicTo(size * 0.88f, size * 0.2f, size * 0.83f, size * 0.58f, cx, size - 3f)
+            close()
+        }
+        canvas.drawPath(pin, paint)
+
+        paint.color = Color.WHITE
+        canvas.drawCircle(cx, headCy, headR, paint)
+        paint.color = Color.rgb(220, 38, 38)
+        paint.typeface = Typeface.DEFAULT_BOLD
+        paint.textAlign = Paint.Align.CENTER
+        paint.textSize = size * 0.18f
+        val textY = headCy - (paint.descent() + paint.ascent()) / 2f
+        canvas.drawText("SOS", cx, textY, paint)
+        return BitmapDrawable(resources, bitmap)
+    }
+
+    private fun riderPinDrawable(riderId: String, riderName: String, ownRider: Boolean): BitmapDrawable {
+        val initials = riderInitials(riderName, riderId)
+        val color = riderColor(riderId, ownRider)
+        val cacheKey = "$riderId|$initials|$color|$ownRider"
+        riderIconCache[cacheKey]?.let { return it }
+
+        val size = RIDER_PIN_SIZE_DP.dp()
+        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        val cx = size / 2f
+        val headCy = size * 0.35f
+        val headR = size * 0.31f
+
+        paint.color = Color.argb(90, 0, 0, 0)
+        canvas.drawOval(
+            size * 0.31f,
+            size * 0.88f,
+            size * 0.69f,
+            size * 0.97f,
+            paint
+        )
+
+        paint.color = color
+        val pin = Path().apply {
+            moveTo(cx, size - 4f)
+            cubicTo(size * 0.14f, size * 0.62f, size * 0.1f, size * 0.18f, cx, size * 0.04f)
+            cubicTo(size * 0.9f, size * 0.18f, size * 0.86f, size * 0.62f, cx, size - 4f)
+            close()
+        }
+        canvas.drawPath(pin, paint)
+
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = size * 0.035f
+        paint.color = Color.argb(190, 0, 0, 0)
+        canvas.drawPath(pin, paint)
+        paint.style = Paint.Style.FILL
+
+        paint.color = Color.WHITE
+        canvas.drawCircle(cx, headCy, headR, paint)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = size * 0.028f
+        paint.color = Color.argb(210, 0, 0, 0)
+        canvas.drawCircle(cx, headCy, headR, paint)
+        paint.style = Paint.Style.FILL
+
+        paint.color = Color.rgb(17, 24, 39)
+        paint.typeface = Typeface.DEFAULT_BOLD
+        paint.textAlign = Paint.Align.CENTER
+        paint.textSize = size * 0.23f
+        val textY = headCy - (paint.descent() + paint.ascent()) / 2f
+        canvas.drawText(initials, cx, textY, paint)
+
+        return BitmapDrawable(resources, bitmap).also {
+            if (riderIconCache.size > MAX_RIDER_ICON_CACHE) {
+                val firstKey = riderIconCache.keys.firstOrNull()
+                if (firstKey != null) riderIconCache.remove(firstKey)
+            }
+            riderIconCache[cacheKey] = it
+        }
+    }
+
+    private fun riderInitials(name: String, fallback: String): String {
+        val source = name.trim().ifBlank { fallback.take(6) }
+        val token = source.split(Regex("\\s+")).firstOrNull().orEmpty()
+        val letters = token.filter { it.isLetterOrDigit() }.take(2)
+            .ifBlank { source.filter { it.isLetterOrDigit() }.take(2) }
+            .ifBlank { "R" }
+        return letters.lowercase(Locale.US).replaceFirstChar { it.uppercase(Locale.US) }
+    }
+
+    private fun riderColor(riderId: String, ownRider: Boolean): Int {
+        if (ownRider) return Color.rgb(37, 99, 235)
+        return RIDER_COLORS[(riderId.hashCode() and Int.MAX_VALUE) % RIDER_COLORS.size]
     }
 
     private fun updateTrail(riderId: String, point: GeoPoint) {
@@ -234,5 +522,24 @@ class LiveMapView(context: Context) : FrameLayout(context) {
         private const val MAX_TRAIL_POINTS = 30
         private const val MIN_TRAIL_POINT_DISTANCE_M = 4.0
         private const val TRACKING_ZOOM = 16.0
+        private const val SOS_PIN_SIZE_DP = 58
+        private const val RIDER_PIN_SIZE_DP = 58
+        private const val ARROW_SIZE_DP = 42
+        private const val EDGE_ARROW_MARGIN_DP = 34
+        private const val MAX_RIDER_ICON_CACHE = 80
+        private val RIDER_COLORS = intArrayOf(
+            Color.rgb(239, 68, 68),
+            Color.rgb(34, 197, 94),
+            Color.rgb(14, 165, 233),
+            Color.rgb(168, 85, 247),
+            Color.rgb(245, 158, 11),
+            Color.rgb(236, 72, 153),
+            Color.rgb(20, 184, 166),
+            Color.rgb(234, 179, 8),
+            Color.rgb(249, 115, 22),
+            Color.rgb(100, 116, 139)
+        )
     }
+
+    private fun Int.dp(): Int = (this * resources.displayMetrics.density).roundToInt()
 }

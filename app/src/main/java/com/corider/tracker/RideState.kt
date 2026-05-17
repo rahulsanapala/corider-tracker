@@ -22,7 +22,9 @@ data class GroupAlert(
     val riderId: String,
     val riderName: String,
     val message: String,
-    val timestampMs: Long
+    val timestampMs: Long,
+    val latE7: Int? = null,
+    val lonE7: Int? = null
 )
 
 data class RegroupPoint(

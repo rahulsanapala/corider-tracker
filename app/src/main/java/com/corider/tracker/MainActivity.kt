@@ -11,12 +11,17 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import android.text.Editable
+import android.text.InputFilter
+import android.text.InputType
 import android.text.SpannableString
 import android.text.Spanned
 import android.text.TextWatcher
@@ -28,6 +33,8 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.InputMethodManager
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -35,6 +42,7 @@ import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import com.corider.tracker.location.LiveLocationService
@@ -45,6 +53,7 @@ import com.corider.tracker.voice.WalkieTalkieSession
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.bottomnavigation.BottomNavigationView
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.database.DatabaseReference
 import com.google.firebase.database.FirebaseDatabase
 import java.util.Locale
 import java.util.UUID
@@ -53,7 +62,7 @@ class MainActivity : Activity(), RideBus.Listener {
     private lateinit var rideCodeInput: EditText
     private lateinit var profileNameInput: EditText
     private lateinit var profileContactInput: EditText
-    private lateinit var profileBloodInput: EditText
+    private lateinit var profileBloodInput: Spinner
     private lateinit var profileBikeInput: EditText
     private lateinit var profileEmergencyInput: EditText
     private lateinit var batteryStatusView: TextView
@@ -61,11 +70,13 @@ class MainActivity : Activity(), RideBus.Listener {
     private lateinit var stopButton: Button
     private lateinit var statusView: TextView
     private lateinit var topBar: LinearLayout
+    private lateinit var topBarBackButton: ImageButton
     private lateinit var pageTitle: TextView
     private lateinit var setupPanel: LinearLayout
 
     private lateinit var sosButton: Button
     private lateinit var regroupButton: Button
+    private lateinit var sosSafeButton: ImageButton
     private lateinit var modeEcoButton: TextView
     private lateinit var modeNormalButton: TextView
     private lateinit var modeFastButton: TextView
@@ -105,18 +116,34 @@ class MainActivity : Activity(), RideBus.Listener {
     private var selectedTab = "map"
     private var selectedGroupCode: String? = null
     private var selectedMapRiderId: String? = null
+    private var profileEditMode = false
     private var groupSearchQuery = ""
     private val groupMemberCounts = mutableMapOf<String, Int>()
     private val groupMemberCountLoading = mutableSetOf<String>()
     private val hideRiderDetailRunnable = Runnable { hideRiderDetail() }
+    private val previewLocationListener = object : LocationListener {
+        override fun onLocationChanged(location: Location) {
+            showPreviewLocation(location)
+        }
+    }
     private var updatingBottomNav = false
     private var currentState = RideState()
     private var rideActive = false
     private var hasRegroupPoint = false
+    private var previewLocationPermissionAsked = false
+    private var previewSnapshot: RiderSnapshot? = null
+    private var visibleSosAlertTimestampMs = 0L
+    private var dismissedSosAlertTimestampMs = 0L
+    private val adminGroups = mutableSetOf<String>()
+    private val adminRidersByGroup = mutableMapOf<String, MutableSet<String>>()
+    private val adminRoleLoading = mutableSetOf<String>()
+    private val adminRoleFetchedAtMs = mutableMapOf<String, Long>()
+    private var selectedRiderActionId: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         super.onCreate(savedInstanceState)
+        adminGroups.addAll(loadLocalAdminGroups())
         walkieTalkie.onStateChanged = { state ->
             syncWalkieForeground(state)
             runOnUiThread { renderWalkieState(state) }
@@ -144,6 +171,7 @@ class MainActivity : Activity(), RideBus.Listener {
         if (::mapView.isInitialized) mapView.onResume()
         if (selectedTab == "profile") updateBatteryStatus()
         refreshActiveTracking()
+        requestPreviewLocationIfNeeded()
     }
 
     override fun onStart() {
@@ -157,11 +185,13 @@ class MainActivity : Activity(), RideBus.Listener {
     }
 
     override fun onPause() {
+        stopPreviewLocation()
         if (::mapView.isInitialized) mapView.onPause()
         super.onPause()
     }
 
     override fun onDestroy() {
+        stopPreviewLocation()
         if (::mapPage.isInitialized) mapPage.removeCallbacks(hideRiderDetailRunnable)
         walkieTalkie.onStateChanged = null
         WalkieTalkieSession.releaseIfIdle(this)
@@ -199,6 +229,8 @@ class MainActivity : Activity(), RideBus.Listener {
             } else if (groupCode != null) {
                 statusView.text = "Microphone permission is needed for walkie talkie."
             }
+        } else if (requestCode == REQUEST_PREVIEW_LOCATION && hasLocationPermission()) {
+            requestPreviewLocationIfNeeded()
         }
     }
 
@@ -237,7 +269,25 @@ class MainActivity : Activity(), RideBus.Listener {
             setBackgroundColor(TOP_BAR)
             elevation = dp(6).toFloat()
 
-            val menu = navIcon("")
+            val leftSlot = FrameLayout(this@MainActivity)
+            topBarBackButton = ImageButton(this@MainActivity).apply {
+                contentDescription = "Back to groups"
+                setImageResource(R.drawable.ic_back)
+                setColorFilter(Color.WHITE)
+                scaleType = ImageView.ScaleType.CENTER
+                setPadding(dp(9), dp(9), dp(9), dp(9))
+                background = oval(Color.argb(42, 255, 255, 255), stroke = Color.argb(90, 255, 255, 255), strokeWidth = 1)
+                visibility = View.GONE
+                isClickable = true
+                isFocusable = true
+                setOnClickListener { renderGroupList() }
+            }
+            leftSlot.addView(
+                topBarBackButton,
+                FrameLayout.LayoutParams(dp(38), dp(38)).apply {
+                    gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                }
+            )
             pageTitle = TextView(this@MainActivity).apply {
                 text = "Map"
                 textSize = 19f
@@ -247,14 +297,20 @@ class MainActivity : Activity(), RideBus.Listener {
             }
             val alert = TextView(this@MainActivity)
 
-            addView(menu, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
+            addView(leftSlot, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
             addView(pageTitle, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 2f))
             addView(alert, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
         }
     }
 
     private fun buildMapPage(): FrameLayout {
-        mapView = LiveMapView(this).apply { onCreate() }
+        mapView = LiveMapView(this).apply {
+            onCreate()
+            onSosMarkerClick = { alert ->
+                showSosAlertDetail(currentState, alert, System.currentTimeMillis(), force = true)
+                focusOnSos()
+            }
+        }
 
         return FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
@@ -271,6 +327,32 @@ class MainActivity : Activity(), RideBus.Listener {
                 setOnClickListener { openActiveGroupFromMap() }
             }
             addView(livePill, overlayParams(Gravity.TOP or Gravity.START, left = 18, top = 136))
+
+            sosSafeButton = ImageButton(this@MainActivity).apply {
+                contentDescription = "Mark safe and clear SOS"
+                setImageResource(R.drawable.ic_safe_shield)
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                setPadding(dp(4), dp(4), dp(4), dp(4))
+                setBackgroundColor(Color.TRANSPARENT)
+                elevation = dp(8).toFloat()
+                visibility = View.GONE
+                setOnClickListener {
+                    dispatchServiceAction(LiveLocationService.ACTION_CLEAR_SOS)
+                    dismissedSosAlertTimestampMs = currentState.groupAlert?.timestampMs ?: dismissedSosAlertTimestampMs
+                    visibleSosAlertTimestampMs = 0L
+                    hideRiderDetail()
+                    statusView.text = "Marked safe. SOS cleared."
+                }
+            }
+            val safeParams = overlayParams(Gravity.TOP or Gravity.END, right = 22, top = 160, width = 58, height = 58)
+            addView(sosSafeButton, safeParams)
+            addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                val top = (height / 4).coerceAtLeast(dp(96))
+                (sosSafeButton.layoutParams as FrameLayout.LayoutParams).apply {
+                    topMargin = top
+                    sosSafeButton.layoutParams = this
+                }
+            }
 
             setupPanel = buildSetupPanel()
             setupPanel.visibility = View.GONE
@@ -289,11 +371,30 @@ class MainActivity : Activity(), RideBus.Listener {
                 gravity = Gravity.CENTER
                 setPadding(dp(22), 0, dp(22), 0)
             }
-            sosButton = bigActionButton("SOS", DANGER, Color.BLACK).apply {
-                setOnClickListener { dispatchServiceAction(LiveLocationService.ACTION_SOS) }
-            }
-            regroupButton = bigActionButton("REGROUP", PILL, Color.BLACK).apply {
+            sosButton = mapActionButton("SOS", R.drawable.ic_sos_alert).apply {
                 setOnClickListener {
+                    if (!rideActive) {
+                        statusView.text = "Make a group active before sending SOS."
+                    } else {
+                        dispatchServiceAction(LiveLocationService.ACTION_SOS)
+                    }
+                }
+            }
+            styleSosButton(active = false)
+            regroupButton = mapActionButton("REGROUP", R.drawable.ic_riders).apply {
+                setOnClickListener {
+                    if (!rideActive) {
+                        statusView.text = "Make a group active before regroup."
+                        return@setOnClickListener
+                    }
+                    if (!isAdminForGroup(currentState.rideId)) {
+                        statusView.text = "Only group admin can regroup riders."
+                        return@setOnClickListener
+                    }
+                    if (currentState.ownLocation == null && !hasRegroupPoint) {
+                        statusView.text = "Waiting for your location before regroup."
+                        return@setOnClickListener
+                    }
                     if (hasRegroupPoint) {
                         dispatchServiceAction(LiveLocationService.ACTION_CLEAR_REGROUP)
                     } else {
@@ -301,8 +402,9 @@ class MainActivity : Activity(), RideBus.Listener {
                     }
                 }
             }
-            actions.addView(sosButton, LinearLayout.LayoutParams(0, dp(64), 1f))
-            actions.addView(regroupButton, LinearLayout.LayoutParams(0, dp(64), 1f).apply { leftMargin = dp(12) })
+            styleRegroupButton(active = false, hasPoint = false)
+            actions.addView(sosButton, LinearLayout.LayoutParams(0, dp(76), 1f))
+            actions.addView(regroupButton, LinearLayout.LayoutParams(0, dp(76), 1f).apply { leftMargin = dp(12) })
             addView(actions, overlayParams(Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL, bottom = 96))
 
             onlinePill = TextView(this@MainActivity).apply {
@@ -470,6 +572,7 @@ class MainActivity : Activity(), RideBus.Listener {
     private fun refreshGroupPage() {
         syncActiveRiderName()
         selectedGroupCode?.let { code ->
+            refreshGroupAdmins(code, force = true)
             if (loadGroups().any { it.code == code }) {
                 renderGroupDetail(code)
             } else {
@@ -489,29 +592,80 @@ class MainActivity : Activity(), RideBus.Listener {
             setBackgroundColor(SURFACE)
         }
 
-        val profilePanel = panel()
-        profilePanel.addView(sectionTitle("RIDER PROFILE"), matchWrapNoMargin())
-        profilePanel.addView(bodyText("This name is used on the live map and group alerts."), matchWrap(top = 6))
+        val profilePanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = gradientRounded(Color.rgb(96, 34, 197), Color.rgb(37, 99, 235), dp(18))
+            elevation = dp(5).toFloat()
+        }
+        val initialProfileName = prefs.getString(KEY_RIDER_NAME, "").orEmpty().ifBlank { "Rider" }
+        val profileTitle = TextView(this).apply {
+            text = initialProfileName
+            textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            maxLines = 1
+        }
+        val profileSubtitle = TextView(this).apply {
+            text = "Rider details"
+            textSize = 12f
+            setTextColor(Color.rgb(219, 234, 254))
+            gravity = Gravity.CENTER
+            setPadding(0, dp(3), 0, dp(12))
+        }
+        val personalCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            background = rounded(Color.WHITE, dp(13), stroke = Color.rgb(226, 232, 240))
+            elevation = dp(4).toFloat()
+        }
+        personalCard.addView(TextView(this).apply {
+            text = "Personal Info"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.rgb(15, 23, 42))
+        }, matchWrapNoMargin())
 
-        profileNameInput = input("Full name", prefs.getString(KEY_RIDER_NAME, "").orEmpty())
-        profileContactInput = input("Contact number", prefs.getString(KEY_CONTACT, "").orEmpty())
-        profileBloodInput = input("Blood group", prefs.getString(KEY_BLOOD_GROUP, "").orEmpty())
-        profileBikeInput = input("Bike / vehicle", prefs.getString(KEY_BIKE, "").orEmpty())
-        profileEmergencyInput = input("Emergency contact", prefs.getString(KEY_EMERGENCY_CONTACT, "").orEmpty())
+        profileNameInput = profileInput("Full name", prefs.getString(KEY_RIDER_NAME, "").orEmpty()).apply {
+            filters = arrayOf(lettersAndSpacesFilter(), InputFilter.LengthFilter(40))
+        }
+        profileContactInput = profileInput("Contact number", prefs.getString(KEY_CONTACT, "").orEmpty()).apply {
+            inputType = InputType.TYPE_CLASS_PHONE
+            filters = arrayOf(digitsOnlyFilter(), InputFilter.LengthFilter(10))
+        }
+        profileBloodInput = bloodGroupDropdown(prefs.getString(KEY_BLOOD_GROUP, "").orEmpty())
+        profileBikeInput = profileInput("Bike / vehicle", prefs.getString(KEY_BIKE, "").orEmpty())
+        profileEmergencyInput = profileInput("Emergency contact", prefs.getString(KEY_EMERGENCY_CONTACT, "").orEmpty()).apply {
+            inputType = InputType.TYPE_CLASS_PHONE
+            filters = arrayOf(digitsOnlyFilter(), InputFilter.LengthFilter(10))
+        }
 
-        profilePanel.addView(profileNameInput, matchWrap(top = 14))
-        profilePanel.addView(profileContactInput, matchWrap(top = 10))
-        profilePanel.addView(profileBloodInput, matchWrap(top = 10))
-        profilePanel.addView(profileBikeInput, matchWrap(top = 10))
-        profilePanel.addView(profileEmergencyInput, matchWrap(top = 10))
+        personalCard.addView(profileNameInput, matchWrap(top = 12))
+        personalCard.addView(profileContactInput, matchWrap(top = 10))
+        personalCard.addView(profileBloodInput, matchWrap(top = 10))
+        personalCard.addView(profileBikeInput, matchWrap(top = 10))
+        personalCard.addView(profileEmergencyInput, matchWrap(top = 10))
 
-        val saveButton = smallCommand("SAVE PROFILE", BLUE).apply {
+        val saveButton = smallCommand("EDIT PROFILE", BLUE).apply {
             setOnClickListener {
-                saveProfile()
-                statusView.text = "Profile saved. Your map name is ${profileName()}."
+                if (!profileEditMode) {
+                    setProfileEditMode(true, this)
+                    statusView.text = "Edit profile details."
+                } else if (validateProfileInputs()) {
+                    saveProfile()
+                    hideKeyboard(this)
+                    setProfileEditMode(false, this)
+                    profileTitle.text = profileName()
+                    statusView.text = "Details updated. Your map name is ${profileName()}."
+                }
             }
         }
-        profilePanel.addView(saveButton, matchWrap(top = 14))
+        personalCard.addView(saveButton, matchWrap(top = 14))
+        setProfileEditMode(false, saveButton)
+        profilePanel.addView(profileTitle, matchWrapNoMargin())
+        profilePanel.addView(profileSubtitle, matchWrapNoMargin())
+        profilePanel.addView(personalCard, matchWrapNoMargin())
         content.addView(profilePanel, matchWrapNoMargin())
 
         val batteryPanel = panel()
@@ -528,20 +682,18 @@ class MainActivity : Activity(), RideBus.Listener {
 
         val batteryButton = smallCommand("BATTERY SETTINGS", BLUE).apply {
             setOnClickListener { openBatterySettings() }
+            styleProfileSettingsButton()
         }
         val appButton = smallCommand("APP SETTINGS", PILL).apply {
             setOnClickListener { openAppSettings() }
+            styleProfileSettingsButton()
         }
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        row.addView(batteryButton, LinearLayout.LayoutParams(0, dp(48), 1f))
-        row.addView(appButton, LinearLayout.LayoutParams(0, dp(48), 1f).apply { leftMargin = dp(10) })
-        batteryPanel.addView(row, matchWrap(top = 12))
+        batteryPanel.addView(batteryButton, matchWrap(top = 12))
+        batteryPanel.addView(appButton, matchWrap(top = 10))
 
         val redmiButton = smallCommand("REDMI AUTOSTART", GREEN).apply {
             setOnClickListener { openRedmiAutostartSettings() }
+            styleProfileSettingsButton()
         }
         batteryPanel.addView(redmiButton, matchWrap(top = 10))
         content.addView(batteryPanel, matchWrap(top = 18))
@@ -558,6 +710,8 @@ class MainActivity : Activity(), RideBus.Listener {
         if (!::groupContent.isInitialized) return
         groupContent.removeAllViews()
         selectedGroupCode = null
+        selectedRiderActionId = null
+        updateTopBarBackButton()
         if (::groupScroll.isInitialized) groupScroll.post { groupScroll.scrollTo(0, 0) }
 
         val groups = loadGroups()
@@ -573,16 +727,7 @@ class MainActivity : Activity(), RideBus.Listener {
 
         refreshGroupMemberCounts(groups)
 
-        val search = input("Search groups", groupSearchQuery).apply {
-            addTextChangedListener(object : TextWatcher {
-                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
-                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
-                    groupSearchQuery = s?.toString().orEmpty()
-                    renderGroupSearchResults(groups)
-                }
-                override fun afterTextChanged(s: Editable?) = Unit
-            })
-        }
+        val search = groupSearchBar(groups)
         groupContent.addView(search, matchWrapNoMargin())
         groupResultsContent = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -600,7 +745,10 @@ class MainActivity : Activity(), RideBus.Listener {
             query.isBlank() ||
                 group.name.contains(query, ignoreCase = true) ||
                 group.code.contains(query, ignoreCase = true)
-        }
+        }.sortedWith(
+            compareByDescending<LocalGroup> { it.code == activeCode && rideActive }
+                .thenBy { it.name.lowercase(Locale.US) }
+        )
 
         if (filteredGroups.isEmpty()) {
             val emptyPanel = panel()
@@ -617,6 +765,60 @@ class MainActivity : Activity(), RideBus.Listener {
         groupResultsContent.addView(joinGroupPanel(collapsed = true), matchWrap(top = 18))
     }
 
+    private fun groupSearchBar(groups: List<LocalGroup>): FrameLayout {
+        val searchBox = FrameLayout(this).apply {
+            background = rounded(INPUT, dp(26), stroke = Color.rgb(71, 85, 105))
+            isClickable = true
+            isFocusable = false
+        }
+        val icon = ImageView(this).apply {
+            setImageResource(R.drawable.ic_search)
+            setColorFilter(Color.rgb(148, 163, 184))
+            alpha = 0.85f
+            visibility = if (groupSearchQuery.isBlank()) View.VISIBLE else View.GONE
+        }
+        val editText = EditText(this).apply {
+            hint = "Search groups"
+            setHintTextColor(Color.rgb(148, 163, 184))
+            setSingleLine(true)
+            setText(groupSearchQuery)
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            minHeight = dp(52)
+            background = null
+            setPadding(if (groupSearchQuery.isBlank()) dp(44) else dp(14), 0, dp(14), 0)
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                    groupSearchQuery = s?.toString().orEmpty()
+                    icon.visibility = View.GONE
+                    setPadding(dp(14), 0, dp(14), 0)
+                    renderGroupSearchResults(groups)
+                }
+                override fun afterTextChanged(s: Editable?) = Unit
+            })
+            setOnFocusChangeListener { _, hasFocus ->
+                val showIcon = !hasFocus && text.isNullOrBlank()
+                icon.visibility = if (showIcon) View.VISIBLE else View.GONE
+                setPadding(if (showIcon) dp(44) else dp(14), 0, dp(14), 0)
+            }
+        }
+        searchBox.setOnClickListener {
+            icon.visibility = View.GONE
+            editText.setPadding(dp(14), 0, dp(14), 0)
+            editText.requestFocus()
+        }
+        searchBox.addView(editText, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, dp(52)))
+        searchBox.addView(
+            icon,
+            FrameLayout.LayoutParams(dp(20), dp(20)).apply {
+                gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                leftMargin = dp(16)
+            }
+        )
+        return searchBox
+    }
+
     private fun groupListItem(group: LocalGroup, activeCode: String): LinearLayout {
         val isActive = group.code == activeCode && rideActive
         return LinearLayout(this).apply {
@@ -626,19 +828,35 @@ class MainActivity : Activity(), RideBus.Listener {
             background = rounded(
                 CARD,
                 dp(8),
-                stroke = if (isActive) GREEN else CARD_STROKE,
-                strokeWidth = if (isActive) 2 else 1
+                stroke = CARD_STROKE,
+                strokeWidth = 1
             )
             setOnClickListener { renderGroupDetail(group.code) }
 
             val details = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL
-                val title = TextView(this@MainActivity).apply {
-                    text = groupListTitle(group)
-                    textSize = 16f
-                    typeface = Typeface.DEFAULT_BOLD
-                    setTextColor(Color.WHITE)
-                    maxLines = 1
+                val titleRow = LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    val title = TextView(this@MainActivity).apply {
+                        text = groupListTitle(group)
+                        textSize = 16f
+                        typeface = Typeface.DEFAULT_BOLD
+                        setTextColor(Color.WHITE)
+                        maxLines = 1
+                    }
+                    addView(title, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                    if (isActive) {
+                        addView(
+                            TextView(this@MainActivity).apply {
+                                text = ""
+                                contentDescription = "Active group"
+                                background = oval(GREEN, stroke = Color.argb(160, 209, 250, 229), strokeWidth = 1)
+                                elevation = dp(2).toFloat()
+                            },
+                            LinearLayout.LayoutParams(dp(9), dp(9)).apply { leftMargin = dp(7) }
+                        )
+                    }
                 }
                 val members = TextView(this@MainActivity).apply {
                     text = groupMemberText(group, isActive)
@@ -647,34 +865,32 @@ class MainActivity : Activity(), RideBus.Listener {
                     setPadding(0, dp(4), 0, 0)
                     maxLines = 1
                 }
-                addView(title, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                addView(titleRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
                 addView(members, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-            }
-            val activeDot = View(this@MainActivity).apply {
-                contentDescription = if (isActive) "Active group" else "Inactive group"
-                background = oval(if (isActive) GREEN else Color.rgb(71, 85, 105), stroke = Color.argb(190, 255, 255, 255), strokeWidth = 1)
             }
             val delete = ImageButton(this@MainActivity).apply {
                 contentDescription = "Delete group"
                 setImageResource(R.drawable.ic_delete)
                 setColorFilter(Color.WHITE)
                 scaleType = ImageView.ScaleType.CENTER
-                setPadding(dp(9), dp(9), dp(9), dp(9))
-                background = rounded(Color.rgb(74, 22, 30), dp(8), stroke = RED, strokeWidth = 2)
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+                setBackgroundColor(Color.TRANSPARENT)
                 isClickable = true
                 isFocusable = true
                 setOnClickListener { confirmDeleteGroup(group) }
             }
 
             addView(details, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(activeDot, LinearLayout.LayoutParams(dp(13), dp(13)).apply { leftMargin = dp(10) })
             addView(delete, LinearLayout.LayoutParams(dp(42), dp(42)).apply { leftMargin = dp(12) })
         }
     }
     private fun renderGroupDetail(groupCode: String) {
         if (!::groupContent.isInitialized) return
         val group = loadGroups().firstOrNull { it.code == groupCode } ?: return
+        if (selectedGroupCode != group.code) selectedRiderActionId = null
         selectedGroupCode = group.code
+        refreshGroupAdminsIfNeeded(group.code)
+        updateTopBarBackButton()
         groupContent.removeAllViews()
         if (::groupScroll.isInitialized) groupScroll.post { groupScroll.scrollTo(0, 0) }
 
@@ -746,16 +962,18 @@ class MainActivity : Activity(), RideBus.Listener {
         val panel = panel()
         panel.addView(sectionTitle("CREATE GROUP"), matchWrapNoMargin())
         val nameInput = input("Group name", "")
-        val codeInput = input("Group code", nextGroupCode()).apply {
-            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
-        }
         panel.addView(nameInput, matchWrap(top = 12))
-        panel.addView(codeInput, matchWrap(top = 10))
         val create = smallCommand("CREATE", BLUE).apply {
             setOnClickListener {
-                val code = codeInput.text.toString().trim().uppercase(Locale.US).ifBlank { nextGroupCode() }
-                val name = nameInput.text.toString().trim().ifBlank { "Ride $code" }
+                val name = nameInput.text.toString().trim()
+                if (name.isBlank()) {
+                    nameInput.error = "Group name is required"
+                    statusView.text = "Enter a group name."
+                    return@setOnClickListener
+                }
+                val code = nextGroupCode()
                 saveGroup(LocalGroup(code, name))
+                markGroupAdmin(code)
                 renderGroupDetail(code)
             }
         }
@@ -793,6 +1011,7 @@ class MainActivity : Activity(), RideBus.Listener {
                     return@setOnClickListener
                 }
                 saveGroup(LocalGroup(code, groupNameForCode(code)))
+                refreshGroupAdmins(code, force = true)
                 renderGroupDetail(code)
             }
         }
@@ -819,6 +1038,8 @@ class MainActivity : Activity(), RideBus.Listener {
                 return@apply
             }
 
+            val canManageRiders = isAdminForGroup(groupCode)
+            val adminIds = adminRidersByGroup[groupCode].orEmpty()
             val now = System.currentTimeMillis()
             val ownSnapshot = currentState.ownLocation
             val ownName = ownSnapshot?.label ?: profileName().ifBlank { "You" }
@@ -829,6 +1050,7 @@ class MainActivity : Activity(), RideBus.Listener {
                     active = ownSnapshot?.let { !it.isStale(now) } ?: rideActive,
                     movementText = riderMovementText(ownSnapshot, now),
                     tagText = "You",
+                    admin = canManageRiders || riderId in adminIds,
                     onClick = { openRiderOnMap(null) }
                 ),
                 matchWrapNoMargin()
@@ -844,10 +1066,21 @@ class MainActivity : Activity(), RideBus.Listener {
                             active = !rider.isStale(now),
                             movementText = riderMovementText(rider, now),
                             tagText = null,
-                            onClick = { openRiderOnMap(rider.id) }
+                            admin = rider.id in adminIds,
+                            onClick = {
+                                if (canManageRiders) {
+                                    selectedRiderActionId = if (selectedRiderActionId == rider.id) null else rider.id
+                                    renderGroupDetail(groupCode)
+                                } else {
+                                    openRiderOnMap(rider.id)
+                                }
+                            }
                         ),
                         matchWrap(top = if (index == 0) 10 else 10)
                     )
+                    if (canManageRiders && selectedRiderActionId == rider.id) {
+                        addView(riderAdminActionsCard(groupCode, rider, rider.id in adminIds), matchWrap(top = 8))
+                    }
                 }
 
             if (currentState.riders.isEmpty()) {
@@ -862,6 +1095,7 @@ class MainActivity : Activity(), RideBus.Listener {
         active: Boolean,
         movementText: String,
         tagText: String?,
+        admin: Boolean,
         onClick: () -> Unit
     ): LinearLayout {
         val accent = if (active) GREEN else RED
@@ -880,7 +1114,7 @@ class MainActivity : Activity(), RideBus.Listener {
             }
 
             val title = TextView(context).apply {
-                text = riderTitleText(name, secondsText)
+                text = riderTitleText(name, secondsText, admin)
                 textSize = 15f
                 setTextColor(Color.WHITE)
                 maxLines = 1
@@ -900,10 +1134,140 @@ class MainActivity : Activity(), RideBus.Listener {
             addView(View(context).apply {
                 background = oval(accent, stroke = Color.argb(180, 255, 255, 255), strokeWidth = 1)
                 contentDescription = if (active) "Active rider" else "Inactive rider"
-            }, LinearLayout.LayoutParams(dp(13), dp(13)).apply {
+            }, LinearLayout.LayoutParams(dp(9), dp(9)).apply {
                 leftMargin = dp(12)
                 topMargin = dp(1)
             })
+        }
+    }
+
+    private fun riderAdminActionsCard(groupCode: String, rider: RiderSnapshot, alreadyAdmin: Boolean): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            background = rounded(Color.rgb(15, 18, 25), dp(10), stroke = Color.rgb(71, 85, 105))
+
+            val viewMap = miniActionButton("VIEW MAP", BLUE).apply {
+                setOnClickListener {
+                    selectedRiderActionId = null
+                    openRiderOnMap(rider.id)
+                }
+            }
+            val remove = miniActionButton("REMOVE", RED).apply {
+                setOnClickListener { confirmRemoveRider(groupCode, rider) }
+            }
+            val makeAdmin = miniActionButton(if (alreadyAdmin) "ADMIN" else "MAKE ADMIN", GREEN).apply {
+                isEnabled = !alreadyAdmin
+                alpha = if (alreadyAdmin) 0.55f else 1f
+                setOnClickListener {
+                    if (!alreadyAdmin) makeRiderAdmin(groupCode, rider)
+                }
+            }
+
+            addView(viewMap, LinearLayout.LayoutParams(0, dp(42), 1f))
+            addView(remove, LinearLayout.LayoutParams(0, dp(42), 1f).apply { leftMargin = dp(8) })
+            addView(makeAdmin, LinearLayout.LayoutParams(0, dp(42), 1f).apply { leftMargin = dp(8) })
+        }
+    }
+
+    private fun miniActionButton(textValue: String, accent: Int): Button {
+        return MaterialButton(this).apply {
+            text = textValue
+            textSize = 10f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            includeFontPadding = false
+            minHeight = dp(40)
+            gravity = Gravity.CENTER
+            background = rounded(Color.argb(48, Color.red(accent), Color.green(accent), Color.blue(accent)), dp(8), stroke = accent, strokeWidth = 1)
+            isAllCaps = false
+        }
+    }
+
+    private fun confirmRemoveRider(groupCode: String, rider: RiderSnapshot) {
+        AlertDialog.Builder(this)
+            .setTitle("Remove rider")
+            .setMessage("Remove ${rider.label} from this group?")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Remove") { _, _ -> removeRiderFromGroup(groupCode, rider) }
+            .show()
+    }
+
+    private fun removeRiderFromGroup(groupCode: String, rider: RiderSnapshot) {
+        if (!isAdminForGroup(groupCode)) {
+            statusView.text = "Only group admin can remove riders."
+            return
+        }
+        withFirebaseAuth {
+            val root = FirebaseDatabase.getInstance().getReference("rides/$groupCode")
+            root.child("removed").child(rider.id).setValue(true)
+            clearRemovedRiderSharedEvents(root, rider.id)
+            root.child("riders").child(rider.id).removeValue()
+            root.child("admins").child(rider.id).removeValue()
+                .addOnSuccessListener {
+                    adminRidersByGroup[groupCode]?.remove(rider.id)
+                    selectedRiderActionId = null
+                    clearRemovedRiderLocalMapState(rider.id)
+                    RideBus.removeRider(rider.id)
+                    statusView.text = "${rider.label} removed from group."
+                    if (selectedTab == "group" && selectedGroupCode == groupCode) renderGroupDetail(groupCode)
+                }
+                .addOnFailureListener { error ->
+                    statusView.text = "Remove failed: ${error.message ?: "network error"}"
+                }
+        }
+    }
+
+    private fun makeRiderAdmin(groupCode: String, rider: RiderSnapshot) {
+        if (!isAdminForGroup(groupCode)) {
+            statusView.text = "Only group admin can make another admin."
+            return
+        }
+        withFirebaseAuth {
+            FirebaseDatabase.getInstance()
+                .getReference("rides/$groupCode/admins/${rider.id}")
+                .setValue(true)
+                .addOnSuccessListener {
+                    adminRidersByGroup.getOrPut(groupCode) { mutableSetOf() }.add(rider.id)
+                    selectedRiderActionId = null
+                    statusView.text = "${rider.label} is now admin."
+                    renderGroupDetail(groupCode)
+                }
+                .addOnFailureListener { error ->
+                    statusView.text = "Admin update failed: ${error.message ?: "network error"}"
+                }
+        }
+    }
+
+    private fun clearRemovedRiderSharedEvents(root: DatabaseReference, removedRiderId: String) {
+        root.child("events").child("sos").get().addOnSuccessListener { snapshot ->
+            if (snapshot.child("riderId").getValue(String::class.java) == removedRiderId) {
+                snapshot.ref.removeValue()
+            }
+        }
+        root.child("events").child("regroup").get().addOnSuccessListener { snapshot ->
+            if (snapshot.child("riderId").getValue(String::class.java) == removedRiderId) {
+                snapshot.ref.removeValue()
+            }
+        }
+        root.child("events").child("safetyCheck").get().addOnSuccessListener { snapshot ->
+            val target = snapshot.child("targetRiderId").getValue(String::class.java)
+            val first = snapshot.child("firstRiderId").getValue(String::class.java)
+            if (target == removedRiderId || first == removedRiderId) {
+                snapshot.ref.removeValue()
+            }
+        }
+    }
+
+    private fun clearRemovedRiderLocalMapState(removedRiderId: String) {
+        if (selectedMapRiderId == removedRiderId) {
+            if (::mapView.isInitialized) mapView.clearTemporaryRider()
+            hideRiderDetail()
+        }
+        if (currentState.groupAlert?.riderId == removedRiderId) {
+            visibleSosAlertTimestampMs = 0L
+            if (::riderDetailCard.isInitialized) riderDetailCard.visibility = View.GONE
         }
     }
 
@@ -1008,6 +1372,9 @@ class MainActivity : Activity(), RideBus.Listener {
 
         FirebaseAuth.getInstance().signInAnonymously()
             .addOnSuccessListener {
+                if (isLocalAdminGroup(rideCode)) {
+                    writeAdminRole(rideCode, riderId)
+                }
                 val intent = Intent(this, LiveLocationService::class.java)
                     .setAction(LiveLocationService.ACTION_START)
                     .putExtra(LiveLocationService.EXTRA_RIDE_ID, rideCode)
@@ -1027,6 +1394,11 @@ class MainActivity : Activity(), RideBus.Listener {
 
     private fun activateGroup(group: LocalGroup) {
         leaveWalkieIfDifferentGroup(group.code)
+        if (isLocalAdminGroup(group.code)) {
+            writeAdminRole(group.code, riderId)
+        } else {
+            refreshGroupAdmins(group.code, force = true)
+        }
         rideCodeInput.setText(group.code)
         prefs.edit()
             .putString(KEY_ACTIVE_GROUP_CODE, group.code)
@@ -1196,18 +1568,35 @@ class MainActivity : Activity(), RideBus.Listener {
 
     private fun render(state: RideState) {
         currentState = state
+        clearMissingSelectedRider(state)
         rideActive = state.active
         hasRegroupPoint = state.regroupPoint != null
+        if (state.active) {
+            stopPreviewLocation()
+        } else {
+            requestPreviewLocationIfNeeded()
+        }
         enforceWalkieActiveGroup(state)
         startButton.isEnabled = !state.active
         stopButton.isEnabled = state.active
-        sosButton.isEnabled = state.active
-        regroupButton.isEnabled = state.active && (state.ownLocation != null || hasRegroupPoint)
+        sosButton.isEnabled = true
+        styleSosButton(active = state.active)
+        regroupButton.isEnabled = true
+        styleRegroupButton(active = state.active, hasPoint = hasRegroupPoint)
         statusView.text = locationStatus(state)
-        mapView.setState(state)
-        updateMapOverlays(state)
+        val mapState = previewMapState(state)
+        mapView.setState(mapState)
+        updateMapOverlays(mapState)
         updateGroupTab(state)
         highlightMode(state.updateMode)
+    }
+
+    private fun clearMissingSelectedRider(state: RideState) {
+        val selectedId = selectedMapRiderId ?: return
+        if (selectedId == SELF_RIDER_ID || state.riders.containsKey(selectedId)) return
+        if (::mapView.isInitialized) mapView.clearTemporaryRider()
+        selectedMapRiderId = null
+        if (::riderDetailCard.isInitialized) riderDetailCard.visibility = View.GONE
     }
 
     private fun updateMapOverlays(state: RideState) {
@@ -1220,14 +1609,20 @@ class MainActivity : Activity(), RideBus.Listener {
         livePill.visibility = if (state.active && state.rideId.isNotBlank()) View.VISIBLE else View.GONE
         livePill.text = "Live  ${state.rideId}"
         livePill.background = statusPill(state.active)
-        onlinePill.text = "Online\n${riders.size} riders online"
-        regroupButton.text = if (state.regroupPoint == null) "REGROUP" else "UNGROUP"
-        regroupButton.background = if (state.regroupPoint == null) {
-            rounded(PILL, dp(13), stroke = Color.BLACK, strokeWidth = 2)
+        onlinePill.text = if (state.active) {
+            "Online\n${riders.size} riders online"
         } else {
-            rounded(Color.rgb(74, 22, 30), dp(13), stroke = Color.BLACK, strokeWidth = 2)
+            "Preview\nOnly you"
+        }
+        styleRegroupButton(active = state.active, hasPoint = state.regroupPoint != null)
+        regroupButton.alpha = if (state.active && !isAdminForGroup(state.rideId)) 0.42f else 1f
+        sosSafeButton.visibility = if (state.groupAlert?.riderId == state.riderId && state.active) {
+            View.VISIBLE
+        } else {
+            View.GONE
         }
         updateSelectedRiderDetail(state, now)
+        updateSosAlertDetail(state, now)
         ridersMiniView.visibility = if (riders.isEmpty()) View.GONE else View.VISIBLE
         ridersMiniView.text = riders.take(3).joinToString(separator = "\n") { rider ->
             val distance = if (own == null) "" else "  ${own.distanceTo(rider).toInt()} m"
@@ -1235,15 +1630,88 @@ class MainActivity : Activity(), RideBus.Listener {
         }
     }
 
+    private fun previewMapState(state: RideState): RideState {
+        if (state.active || state.ownLocation != null) return state
+        val preview = previewSnapshot ?: return state
+        return state.copy(
+            ownLocation = preview,
+            status = "Previewing your location"
+        )
+    }
+
+    private fun requestPreviewLocationIfNeeded() {
+        if (!::mapView.isInitialized || rideActive) return
+        if (!hasLocationPermission()) {
+            if (!previewLocationPermissionAsked) {
+                previewLocationPermissionAsked = true
+                requestPermissions(
+                    arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION),
+                    REQUEST_PREVIEW_LOCATION
+                )
+            }
+            return
+        }
+
+        val manager = getSystemService(LocationManager::class.java)
+        val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+            .filter { manager.isProviderEnabled(it) }
+        providers
+            .mapNotNull { provider -> runCatching { manager.getLastKnownLocation(provider) }.getOrNull() }
+            .maxByOrNull { it.time }
+            ?.let { showPreviewLocation(it) }
+
+        providers.forEach { provider ->
+            runCatching {
+                manager.requestLocationUpdates(
+                    provider,
+                    PREVIEW_LOCATION_INTERVAL_MS,
+                    PREVIEW_LOCATION_DISTANCE_M,
+                    previewLocationListener
+                )
+            }
+        }
+    }
+
+    private fun stopPreviewLocation() {
+        if (!hasLocationPermission()) return
+        runCatching {
+            getSystemService(LocationManager::class.java).removeUpdates(previewLocationListener)
+        }
+    }
+
+    private fun showPreviewLocation(location: Location) {
+        if (rideActive) return
+        val now = System.currentTimeMillis()
+        val snapshot = RiderSnapshot.fromLocation(
+            id = riderId,
+            name = profileName(),
+            location = location,
+            nowMs = now
+        )
+        previewSnapshot = snapshot
+        val mapState = previewMapState(currentState)
+        mapView.setState(mapState)
+        updateMapOverlays(mapState)
+    }
+
     private fun openRiderOnMap(riderId: String?) {
         selectedMapRiderId = riderId ?: SELF_RIDER_ID
         switchTab("map")
+        val now = System.currentTimeMillis()
         if (riderId == null) {
+            mapView.clearTemporaryRider()
             mapView.centerOnMe()
         } else {
-            mapView.focusOnRider(riderId)
+            val snapshot = currentState.riders[riderId]
+            if (snapshot != null && snapshot.isStale(now)) {
+                mapView.showTemporaryRider(snapshot)
+                statusView.text = "Showing ${snapshot.label}'s last known location."
+            } else {
+                mapView.clearTemporaryRider()
+                mapView.focusOnRider(riderId)
+            }
         }
-        updateSelectedRiderDetail(currentState, System.currentTimeMillis())
+        updateSelectedRiderDetail(currentState, now)
         scheduleRiderDetailTimeout()
     }
 
@@ -1257,11 +1725,14 @@ class MainActivity : Activity(), RideBus.Listener {
 
         val snapshot = if (selectedId == SELF_RIDER_ID) state.ownLocation else state.riders[selectedId]
         if (snapshot == null) {
-            riderDetailText.text = "Rider location not available"
-            riderDetailCard.visibility = View.VISIBLE
+            visibleSosAlertTimestampMs = 0L
+            selectedMapRiderId = null
+            riderDetailCard.visibility = View.GONE
             return
         }
 
+        visibleSosAlertTimestampMs = 0L
+        styleRiderDetailCard()
         val distance = if (selectedId == SELF_RIDER_ID) {
             "You"
         } else {
@@ -1276,13 +1747,93 @@ class MainActivity : Activity(), RideBus.Listener {
         riderDetailCard.visibility = View.VISIBLE
     }
 
-    private fun riderTitleText(name: String, secondsText: String): SpannableString {
-        val updateText = if (secondsText == "--") "updated --" else "updated $secondsText ago"
-        val text = "$name  $updateText"
+    private fun updateSosAlertDetail(state: RideState, nowMs: Long) {
+        val alert = state.groupAlert
+        if (alert == null) {
+            if (visibleSosAlertTimestampMs > 0L) {
+                visibleSosAlertTimestampMs = 0L
+                if (::riderDetailCard.isInitialized) riderDetailCard.visibility = View.GONE
+            }
+            return
+        }
+        if (alert.timestampMs <= dismissedSosAlertTimestampMs) return
+        if (selectedMapRiderId != null && visibleSosAlertTimestampMs != alert.timestampMs) return
+        showSosAlertDetail(state, alert, nowMs, force = visibleSosAlertTimestampMs == alert.timestampMs)
+    }
+
+    private fun showSosAlertDetail(state: RideState, alert: GroupAlert, nowMs: Long, force: Boolean) {
+        if (!force && alert.timestampMs <= dismissedSosAlertTimestampMs) return
+        if (!::riderDetailCard.isInitialized || !::riderDetailText.isInitialized) return
+        selectedMapRiderId = null
+        visibleSosAlertTimestampMs = alert.timestampMs
+        styleSosDetailCard()
+        riderDetailText.text = buildSosDetailText(state, alert, nowMs)
+        riderDetailCard.visibility = View.VISIBLE
+        scheduleRiderDetailTimeout()
+    }
+
+    private fun styleRiderDetailCard() {
+        riderDetailCard.background = rounded(Color.rgb(219, 239, 255), dp(8), stroke = Color.BLACK, strokeWidth = 1)
+        riderDetailText.setTextColor(Color.rgb(15, 23, 42))
+    }
+
+    private fun styleSosDetailCard() {
+        riderDetailCard.background = rounded(Color.argb(210, 255, 255, 255), dp(8), stroke = RED, strokeWidth = 2)
+        riderDetailText.setTextColor(Color.rgb(31, 41, 55))
+    }
+
+    private fun buildSosDetailText(state: RideState, alert: GroupAlert, nowMs: Long): SpannableString {
+        val ageSeconds = ((nowMs - alert.timestampMs).coerceAtLeast(0L)) / 1000L
+        val distance = sosAlertSnapshot(state, alert)?.let { snapshot ->
+            state.ownLocation?.let { "${formatDistance(it.distanceTo(snapshot))} away" }
+        } ?: "Location marked on map"
+        val header = "SOS  ${alert.riderName}"
+        val body = "${alert.message} - ${formatDurationShort(ageSeconds)} ago\n$distance"
+        val text = "$header\n$body"
         return SpannableString(text).apply {
-            val updateStart = name.length + 2
+            val bodyStart = header.length + 1
+            setSpan(StyleSpan(Typeface.BOLD), 0, 3, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            setSpan(RelativeSizeSpan(1.18f), 0, header.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            setSpan(ForegroundColorSpan(RED), 0, 3, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            setSpan(ForegroundColorSpan(Color.rgb(15, 23, 42)), 5, header.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            setSpan(RelativeSizeSpan(0.96f), bodyStart, text.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            setSpan(ForegroundColorSpan(Color.rgb(31, 41, 55)), bodyStart, text.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+    }
+
+    private fun sosAlertSnapshot(state: RideState, alert: GroupAlert): RiderSnapshot? {
+        val lat = alert.latE7
+        val lon = alert.lonE7
+        if (lat != null && lon != null) {
+            return RiderSnapshot(
+                id = alert.riderId,
+                name = alert.riderName,
+                latE7 = lat,
+                lonE7 = lon,
+                speedCentiMps = 0,
+                bearingDeg = -1,
+                accuracyM = -1,
+                updatedAtMs = alert.timestampMs
+            )
+        }
+        state.ownLocation?.takeIf { it.id == alert.riderId }?.let { return it }
+        return state.riders[alert.riderId]
+    }
+
+    private fun riderTitleText(name: String, secondsText: String, admin: Boolean): SpannableString {
+        val updateText = if (secondsText == "--") "updated --" else "updated $secondsText ago"
+        val adminText = if (admin) "  ADMIN" else ""
+        val text = "$name$adminText  $updateText"
+        return SpannableString(text).apply {
+            val adminStart = name.length + 2
+            val updateStart = name.length + adminText.length + 2
             setSpan(StyleSpan(Typeface.BOLD), 0, name.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             setSpan(ForegroundColorSpan(Color.WHITE), 0, name.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            if (admin) {
+                setSpan(StyleSpan(Typeface.BOLD), adminStart, name.length + adminText.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                setSpan(RelativeSizeSpan(0.72f), adminStart, name.length + adminText.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                setSpan(ForegroundColorSpan(GREEN), adminStart, name.length + adminText.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
             setSpan(RelativeSizeSpan(0.78f), updateStart, text.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             setSpan(ForegroundColorSpan(Color.rgb(148, 163, 184)), updateStart, text.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         }
@@ -1308,6 +1859,10 @@ class MainActivity : Activity(), RideBus.Listener {
 
     private fun hideRiderDetail() {
         selectedMapRiderId = null
+        if (visibleSosAlertTimestampMs > 0L) {
+            dismissedSosAlertTimestampMs = visibleSosAlertTimestampMs
+            visibleSosAlertTimestampMs = 0L
+        }
         if (::mapPage.isInitialized) mapPage.removeCallbacks(hideRiderDetailRunnable)
         if (::riderDetailCard.isInitialized) riderDetailCard.visibility = View.GONE
     }
@@ -1337,6 +1892,12 @@ class MainActivity : Activity(), RideBus.Listener {
     }
 
     private fun switchTab(tab: String) {
+        if (selectedTab == "map" && tab != "map" && ::mapView.isInitialized) {
+            mapView.clearTemporaryRider()
+            if (selectedMapRiderId != null) {
+                hideRiderDetail()
+            }
+        }
         selectedTab = tab
         mapPage.visibility = if (tab == "map") View.VISIBLE else View.GONE
         groupPage.visibility = if (tab == "group") View.VISIBLE else View.GONE
@@ -1347,9 +1908,19 @@ class MainActivity : Activity(), RideBus.Listener {
             "profile" -> "Profile"
             else -> "Map"
         }
+        updateTopBarBackButton()
         if (tab == "profile") updateBatteryStatus()
         setupPanel.visibility = View.GONE
         styleBottomTabs()
+    }
+
+    private fun updateTopBarBackButton() {
+        if (!::topBarBackButton.isInitialized) return
+        topBarBackButton.visibility = if (selectedTab == "group" && selectedGroupCode != null) {
+            View.VISIBLE
+        } else {
+            View.GONE
+        }
     }
 
     private fun setMode(mode: UpdateMode) {
@@ -1415,11 +1986,61 @@ class MainActivity : Activity(), RideBus.Listener {
         prefs.edit()
             .putString(KEY_RIDER_NAME, profileNameInput.text.toString().trim())
             .putString(KEY_CONTACT, profileContactInput.text.toString().trim())
-            .putString(KEY_BLOOD_GROUP, profileBloodInput.text.toString().trim())
+            .putString(KEY_BLOOD_GROUP, selectedBloodGroup())
             .putString(KEY_BIKE, profileBikeInput.text.toString().trim())
             .putString(KEY_EMERGENCY_CONTACT, profileEmergencyInput.text.toString().trim())
             .apply()
         syncActiveRiderName()
+    }
+
+    private fun setProfileEditMode(enabled: Boolean, button: Button? = null) {
+        profileEditMode = enabled
+        listOf(profileNameInput, profileContactInput, profileBikeInput, profileEmergencyInput).forEach { field ->
+            field.isEnabled = enabled
+            field.isFocusable = enabled
+            field.isFocusableInTouchMode = enabled
+            field.isCursorVisible = enabled
+            field.alpha = 1f
+            field.setTextColor(Color.rgb(15, 23, 42))
+            field.setHintTextColor(Color.rgb(100, 116, 139))
+            field.background = profileFieldBackground()
+        }
+        profileBloodInput.isEnabled = enabled
+        profileBloodInput.alpha = 1f
+        profileBloodInput.background = profileFieldBackground()
+        button?.text = if (enabled) "SAVE CHANGES" else "EDIT PROFILE"
+    }
+
+    private fun validateProfileInputs(): Boolean {
+        val name = profileNameInput.text.toString().trim()
+        val contact = profileContactInput.text.toString().trim()
+        val blood = selectedBloodGroup()
+        val emergency = profileEmergencyInput.text.toString().trim()
+        var valid = true
+
+        profileNameInput.error = null
+        profileContactInput.error = null
+        profileEmergencyInput.error = null
+        profileBloodInput.background = profileFieldBackground()
+
+        if (!name.matches(Regex("^[A-Za-z][A-Za-z ]{1,39}$"))) {
+            profileNameInput.error = "Use letters only"
+            valid = false
+        }
+        if (!contact.matches(Regex("^[0-9]{10}$"))) {
+            profileContactInput.error = "Enter 10 digit mobile number"
+            valid = false
+        }
+        if (blood.isBlank()) {
+            profileBloodInput.background = profileFieldBackground(error = true)
+            valid = false
+        }
+        if (!emergency.matches(Regex("^[0-9]{10}$"))) {
+            profileEmergencyInput.error = "Enter 10 digit emergency number"
+            valid = false
+        }
+        if (!valid) statusView.text = "Please fix profile details."
+        return valid
     }
 
     private fun syncActiveRiderName() {
@@ -1583,6 +2204,101 @@ class MainActivity : Activity(), RideBus.Listener {
             groupMemberCounts[group.code]
         }
         return if (count == null) "Members updating..." else "$count ${if (count == 1) "member" else "members"}"
+    }
+
+    private fun loadLocalAdminGroups(): Set<String> {
+        return prefs.getStringSet(KEY_ADMIN_GROUPS, emptySet()).orEmpty()
+    }
+
+    private fun saveLocalAdminGroups() {
+        prefs.edit().putStringSet(KEY_ADMIN_GROUPS, adminGroups.toSet()).apply()
+    }
+
+    private fun isLocalAdminGroup(groupCode: String): Boolean {
+        return groupCode.isNotBlank() && (groupCode in adminGroups || groupCode in loadLocalAdminGroups())
+    }
+
+    private fun isAdminForGroup(groupCode: String): Boolean {
+        if (groupCode.isBlank()) return false
+        return isLocalAdminGroup(groupCode) || riderId in adminRidersByGroup[groupCode].orEmpty()
+    }
+
+    private fun markGroupAdmin(groupCode: String) {
+        if (groupCode.isBlank()) return
+        adminGroups.add(groupCode)
+        saveLocalAdminGroups()
+        adminRidersByGroup.getOrPut(groupCode) { mutableSetOf() }.add(riderId)
+        writeAdminRole(groupCode, riderId)
+    }
+
+    private fun writeAdminRole(groupCode: String, adminRiderId: String) {
+        if (groupCode.isBlank() || adminRiderId.isBlank()) return
+        withFirebaseAuth {
+            val root = FirebaseDatabase.getInstance().getReference("rides/$groupCode")
+            root.child("admins").child(adminRiderId).setValue(true)
+        }
+    }
+
+    private fun refreshGroupAdminsIfNeeded(groupCode: String) {
+        val last = adminRoleFetchedAtMs[groupCode] ?: 0L
+        if (System.currentTimeMillis() - last < ADMIN_ROLE_REFRESH_MS) return
+        refreshGroupAdmins(groupCode, force = false)
+    }
+
+    private fun refreshGroupAdmins(groupCode: String, force: Boolean) {
+        if (groupCode.isBlank()) return
+        if (!force && !adminRoleLoading.add(groupCode)) return
+        if (force && groupCode in adminRoleLoading) return
+        if (force) adminRoleLoading.add(groupCode)
+
+        withFirebaseAuth {
+            FirebaseDatabase.getInstance()
+                .getReference("rides/$groupCode/admins")
+                .get()
+                .addOnSuccessListener { snapshot ->
+                    val admins = mutableSetOf<String>()
+                    snapshot.children.forEach { child ->
+                        if (child.getValue(Boolean::class.java) == true) {
+                            child.key?.let { admins.add(it) }
+                        }
+                    }
+                    if (admins.isEmpty() && isLocalAdminGroup(groupCode)) {
+                        admins.add(riderId)
+                        writeAdminRole(groupCode, riderId)
+                    }
+                    adminRidersByGroup[groupCode] = admins
+                    if (riderId in admins) {
+                        adminGroups.add(groupCode)
+                        saveLocalAdminGroups()
+                    }
+                    adminRoleFetchedAtMs[groupCode] = System.currentTimeMillis()
+                    if (selectedTab == "group" && selectedGroupCode == groupCode) {
+                        renderGroupDetail(groupCode)
+                    }
+                    if (currentState.rideId == groupCode) {
+                        updateMapOverlays(currentState)
+                    }
+                }
+                .addOnFailureListener { error ->
+                    statusView.text = "Admin role sync failed: ${error.message ?: "network error"}"
+                }
+                .addOnCompleteListener {
+                    adminRoleLoading.remove(groupCode)
+                }
+        }
+    }
+
+    private fun withFirebaseAuth(block: () -> Unit) {
+        val auth = FirebaseAuth.getInstance()
+        if (auth.currentUser != null) {
+            block()
+            return
+        }
+        auth.signInAnonymously()
+            .addOnSuccessListener { block() }
+            .addOnFailureListener { error ->
+                statusView.text = "Firebase auth failed: ${error.message ?: "unknown"}"
+            }
     }
 
     private fun riderListText(groupCode: String): String {
@@ -1763,6 +2479,70 @@ class MainActivity : Activity(), RideBus.Listener {
         }
     }
 
+    private fun mapActionButton(textValue: String, iconRes: Int): Button {
+        return MaterialButton(this).apply {
+            text = textValue
+            textSize = 10.5f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.BLACK)
+            gravity = Gravity.CENTER
+            textAlignment = View.TEXT_ALIGNMENT_CENTER
+            setSingleLine(false)
+            maxLines = 2
+            includeFontPadding = false
+            minHeight = dp(76)
+            minWidth = 0
+            setPadding(0, dp(11), 0, dp(9))
+            cornerRadius = dp(12)
+            backgroundTintList = ColorStateList.valueOf(Color.TRANSPARENT)
+            strokeColor = ColorStateList.valueOf(Color.BLACK)
+            strokeWidth = dp(2)
+            rippleColor = ColorStateList.valueOf(Color.argb(50, 0, 0, 0))
+            setIconResource(iconRes)
+            iconGravity = MaterialButton.ICON_GRAVITY_TEXT_TOP
+            iconPadding = dp(3)
+            iconSize = dp(23)
+            iconTint = ColorStateList.valueOf(Color.BLACK)
+            isAllCaps = false
+        }
+    }
+
+    private fun styleSosButton(active: Boolean) {
+        if (!::sosButton.isInitialized) return
+        val iconColor = if (active) Color.rgb(220, 38, 38) else Color.BLACK
+        (sosButton as? MaterialButton)?.apply {
+            text = "SOS"
+            textSize = 10.5f
+            setTextColor(iconColor)
+            iconTint = ColorStateList.valueOf(iconColor)
+            backgroundTintList = ColorStateList.valueOf(Color.TRANSPARENT)
+            strokeColor = ColorStateList.valueOf(Color.BLACK)
+            strokeWidth = dp(2)
+            iconGravity = MaterialButton.ICON_GRAVITY_TEXT_TOP
+            iconPadding = dp(3)
+            iconSize = dp(23)
+            alpha = 1f
+        }
+    }
+
+    private fun styleRegroupButton(active: Boolean, hasPoint: Boolean) {
+        if (!::regroupButton.isInitialized) return
+        val iconColor = if (active) Color.rgb(220, 38, 38) else Color.BLACK
+        (regroupButton as? MaterialButton)?.apply {
+            text = if (hasPoint) "UNGROUP" else "REGROUP"
+            textSize = 10.5f
+            setTextColor(iconColor)
+            iconTint = ColorStateList.valueOf(iconColor)
+            backgroundTintList = ColorStateList.valueOf(Color.TRANSPARENT)
+            strokeColor = ColorStateList.valueOf(Color.BLACK)
+            strokeWidth = dp(2)
+            iconGravity = MaterialButton.ICON_GRAVITY_TEXT_TOP
+            iconPadding = dp(3)
+            iconSize = dp(23)
+            alpha = 1f
+        }
+    }
+
     private fun smallCommand(textValue: String, fill: Int): Button {
         return MaterialButton(this).apply {
             text = textValue
@@ -1779,6 +2559,16 @@ class MainActivity : Activity(), RideBus.Listener {
         }
     }
 
+    private fun Button.styleProfileSettingsButton() {
+        textSize = 13f
+        gravity = Gravity.CENTER
+        setSingleLine(true)
+        maxLines = 1
+        includeFontPadding = false
+        minHeight = dp(48)
+        setPadding(dp(12), 0, dp(12), 0)
+    }
+
     private fun input(hintText: String, value: String): EditText {
         return EditText(this).apply {
             hint = hintText
@@ -1791,6 +2581,91 @@ class MainActivity : Activity(), RideBus.Listener {
             setPadding(dp(14), 0, dp(14), 0)
             background = rounded(INPUT, dp(8), stroke = CARD_STROKE)
         }
+    }
+
+    private fun profileInput(hintText: String, value: String): EditText {
+        return EditText(this).apply {
+            hint = hintText
+            setHintTextColor(Color.rgb(100, 116, 139))
+            setSingleLine(true)
+            setText(value)
+            textSize = 14f
+            setTextColor(Color.rgb(15, 23, 42))
+            minHeight = dp(50)
+            setPadding(dp(14), 0, dp(14), 0)
+            background = profileFieldBackground()
+        }
+    }
+
+    private fun profileFieldBackground(error: Boolean = false): GradientDrawable {
+        return rounded(
+            Color.rgb(248, 250, 252),
+            dp(10),
+            stroke = if (error) RED else Color.rgb(203, 213, 225),
+            strokeWidth = if (error) 2 else 1
+        )
+    }
+
+    private fun lettersAndSpacesFilter(): InputFilter {
+        return InputFilter { source, start, end, _, _, _ ->
+            val filtered = source.subSequence(start, end).filter { it.isLetter() || it == ' ' }
+            if (filtered.length == end - start) null else filtered
+        }
+    }
+
+    private fun digitsOnlyFilter(): InputFilter {
+        return InputFilter { source, start, end, _, _, _ ->
+            val filtered = source.subSequence(start, end).filter { it.isDigit() }
+            if (filtered.length == end - start) null else filtered
+        }
+    }
+
+    private fun bloodGroupDropdown(value: String): Spinner {
+        val options = listOf("Select blood group", "A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-")
+        val adapter = object : ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, options) {
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                return (super.getView(position, convertView, parent) as TextView).apply {
+                    textSize = 14f
+                    setTextColor(if (position == 0) Color.rgb(100, 116, 139) else Color.rgb(15, 23, 42))
+                    setBackgroundColor(Color.rgb(248, 250, 252))
+                    setPadding(dp(14), 0, dp(14), 0)
+                }
+            }
+
+            override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View {
+                return (super.getDropDownView(position, convertView, parent) as TextView).apply {
+                    textSize = 16f
+                    setTextColor(if (position == 0) Color.rgb(100, 116, 139) else Color.rgb(15, 23, 42))
+                    setBackgroundColor(Color.WHITE)
+                    setPadding(dp(16), dp(12), dp(16), dp(12))
+                }
+            }
+        }.apply {
+            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        }
+        val selectedIndex = options.indexOf(value.trim().uppercase(Locale.US)).takeIf { it > 0 } ?: 0
+        return Spinner(this).apply {
+            this.adapter = adapter
+            setSelection(selectedIndex)
+            minimumHeight = dp(52)
+            background = profileFieldBackground()
+            setPopupBackgroundDrawable(rounded(Color.WHITE, dp(8), stroke = Color.rgb(203, 213, 225)))
+            setPadding(0, 0, 0, 0)
+            setOnTouchListener { view, _ ->
+                hideKeyboard(view)
+                false
+            }
+        }
+    }
+
+    private fun selectedBloodGroup(): String {
+        val value = profileBloodInput.selectedItem?.toString().orEmpty()
+        return if (value == "Select blood group") "" else value
+    }
+
+    private fun hideKeyboard(view: View) {
+        getSystemService(InputMethodManager::class.java)
+            .hideSoftInputFromWindow(view.windowToken, 0)
     }
 
     private fun panel(): LinearLayout {
@@ -1818,40 +2693,43 @@ class MainActivity : Activity(), RideBus.Listener {
             background = gradientRounded(Color.rgb(20, 27, 36), Color.rgb(14, 17, 23), dp(12), stroke = CARD_STROKE)
             elevation = dp(6).toFloat()
         }
-        val stripe = View(this).apply {
-            setBackgroundColor(if (isActiveGroup) GREEN else RED)
-        }
-        card.addView(
-            stripe,
-            FrameLayout.LayoutParams(dp(4), headerHeight).apply {
-                gravity = Gravity.START
-            }
-        )
-
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(20), dp(14), dp(18), dp(14))
+            setPadding(dp(20), dp(14), dp(14), dp(14))
         }
-        val title = TextView(this).apply {
-            text = groupDisplayTitle(group)
-            textSize = 16f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.WHITE)
-            setLineSpacing(dp(3).toFloat(), 1.0f)
+        val titleColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val title = TextView(this@MainActivity).apply {
+                text = groupDisplayTitle(group)
+                textSize = 16f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.WHITE)
+                maxLines = 1
+            }
+            val statusLabel = TextView(this@MainActivity).apply {
+                text = "Group ID: ${group.code}"
+                textSize = 11f
+                setTextColor(Color.rgb(148, 163, 184))
+                setPadding(0, dp(4), 0, 0)
+            }
+            addView(title, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(statusLabel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
         val activeToggle = TextView(this).apply {
             text = if (isActiveGroup) "ACTIVE" else "OFFLINE"
-            textSize = 12f
+            textSize = 10.5f
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
             setTextColor(Color.WHITE)
+            setSingleLine(true)
+            includeFontPadding = false
             isClickable = true
             isFocusable = true
             background = if (isActiveGroup) {
-                rounded(Color.rgb(7, 74, 43), dp(8), stroke = GREEN, strokeWidth = 2)
+                rounded(Color.rgb(7, 74, 43), dp(8), stroke = GREEN, strokeWidth = 1)
             } else {
-                rounded(Color.rgb(74, 22, 30), dp(8), stroke = RED, strokeWidth = 2)
+                rounded(Color.rgb(74, 22, 30), dp(8), stroke = RED, strokeWidth = 1)
             }
             setOnClickListener {
                 if (rideActive && currentState.rideId == group.code) {
@@ -1861,9 +2739,9 @@ class MainActivity : Activity(), RideBus.Listener {
                 }
             }
         }
-        row.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        row.addView(activeToggle, LinearLayout.LayoutParams(dp(96), dp(44)).apply { leftMargin = dp(10) })
-        row.addView(inviteRiderButton(group.code), LinearLayout.LayoutParams(dp(52), dp(52)).apply { leftMargin = dp(12) })
+        row.addView(titleColumn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(activeToggle, LinearLayout.LayoutParams(dp(74), dp(34)).apply { leftMargin = dp(8) })
+        row.addView(inviteRiderButton(group.code), LinearLayout.LayoutParams(dp(48), dp(48)).apply { leftMargin = dp(10) })
         card.addView(row, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, headerHeight))
         return card
     }
@@ -1873,7 +2751,7 @@ class MainActivity : Activity(), RideBus.Listener {
         return if (name.isBlank() || name.equals(group.code, ignoreCase = true) || name.equals("Ride ${group.code}", ignoreCase = true)) {
             group.code
         } else {
-            "$name\n${group.code}"
+            name
         }
     }
 
@@ -2092,16 +2970,20 @@ class MainActivity : Activity(), RideBus.Listener {
     companion object {
         private const val REQUEST_PERMISSIONS = 41
         private const val REQUEST_AUDIO = 42
+        private const val REQUEST_PREVIEW_LOCATION = 43
         private const val MIN_WALKIE_RIDERS = 2
         private const val UI_MOVING_SPEED_MPS = 0.8
         private const val STOPPED_LABEL_AFTER_SECONDS = 10 * 60L
         private const val RIDER_DETAIL_TIMEOUT_MS = 60_000L
+        private const val PREVIEW_LOCATION_INTERVAL_MS = 10_000L
+        private const val PREVIEW_LOCATION_DISTANCE_M = 5f
         private const val SELF_RIDER_ID = "__self__"
         private const val TAG = "CoRider"
         private const val KEY_RIDE_CODE = "ride_code"
         private const val KEY_RIDER_NAME = "rider_name"
         private const val KEY_RIDER_ID = "rider_id"
         private const val KEY_GROUPS = "groups"
+        private const val KEY_ADMIN_GROUPS = "admin_groups"
         private const val KEY_ACTIVE_GROUP_CODE = "active_group_code"
         private const val KEY_CONTACT = "contact"
         private const val KEY_BLOOD_GROUP = "blood_group"
@@ -2109,6 +2991,7 @@ class MainActivity : Activity(), RideBus.Listener {
         private const val KEY_EMERGENCY_CONTACT = "emergency_contact"
         private const val INVITE_HOST = "rahulsanapala.github.io"
         private const val INVITE_PATH = "/corider-tracker/join.html"
+        private const val ADMIN_ROLE_REFRESH_MS = 60_000L
 
         private val SURFACE = Color.rgb(7, 9, 13)
         private val TOP_BAR = Color.rgb(5, 7, 12)

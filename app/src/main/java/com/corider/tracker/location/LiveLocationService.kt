@@ -25,6 +25,8 @@ import com.corider.tracker.GroupAlert
 import com.corider.tracker.RegroupPoint
 import com.corider.tracker.SafetyCheck
 import com.corider.tracker.UpdateMode
+import com.corider.tracker.voice.WalkieForegroundService
+import com.corider.tracker.voice.WalkieTalkieSession
 import com.google.firebase.database.ChildEventListener
 import com.google.firebase.database.DataSnapshot
 import com.google.firebase.database.DatabaseError
@@ -49,6 +51,7 @@ class LiveLocationService : Service(), LocationListener {
     private var regroupListener: ValueEventListener? = null
     private var modeListener: ValueEventListener? = null
     private var safetyListener: ValueEventListener? = null
+    private var removedListener: ValueEventListener? = null
     private var safetyRiders = LinkedHashMap<String, RiderSnapshot>()
     private var localStationarySinceMs = 0L
     private var lastPublishedSafetyCheckId = ""
@@ -79,6 +82,7 @@ class LiveLocationService : Service(), LocationListener {
                 stopSelf()
             }
             ACTION_SOS -> publishSos()
+            ACTION_CLEAR_SOS -> clearSos()
             ACTION_REGROUP -> publishRegroup()
             ACTION_CLEAR_REGROUP -> clearRegroup()
             ACTION_ACK_SAFETY -> acknowledgeSafety(intent.getStringExtra(EXTRA_SAFETY_CHECK_ID).orEmpty())
@@ -359,6 +363,7 @@ class LiveLocationService : Service(), LocationListener {
         const val EXTRA_RIDER_ID = "rider_id"
         const val EXTRA_RIDER_NAME = "rider_name"
         const val ACTION_SOS = "com.corider.tracker.SOS"
+        const val ACTION_CLEAR_SOS = "com.corider.tracker.CLEAR_SOS"
         const val ACTION_REGROUP = "com.corider.tracker.REGROUP"
         const val ACTION_CLEAR_REGROUP = "com.corider.tracker.CLEAR_REGROUP"
         const val ACTION_ACK_SAFETY = "com.corider.tracker.ACK_SAFETY"
@@ -380,17 +385,29 @@ class LiveLocationService : Service(), LocationListener {
         private const val STATIONARY_REQUIRED_MS = 10 * 60 * 1000L
         private const val ACK_TIMEOUT_MS = 5 * 60 * 1000L
         private const val GAP_REQUIRED_M = 2_000
+        private const val SOS_VISIBLE_WINDOW_MS = 15 * 60 * 1000L
     }
 
     private fun startGroupEventListeners() {
         val root = FirebaseDatabase.getInstance().getReference(rideRootPath)
         alertListener = object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
+                if (!snapshot.exists()) {
+                    RideBus.setGroupAlert(null)
+                    return
+                }
                 val msg = snapshot.child("message").getValue(String::class.java) ?: return
                 val id = snapshot.child("riderId").getValue(String::class.java) ?: return
                 val name = snapshot.child("riderName").getValue(String::class.java) ?: "Rider"
-                val ts = snapshot.child("timestampMs").getValue(Long::class.java) ?: System.currentTimeMillis()
-                val alert = GroupAlert(id, name, msg, ts)
+                val ts = snapshot.child("timestampMs").getValue(Long::class.java) ?: return
+                val now = System.currentTimeMillis()
+                if (ts <= groupEventsStartedAtMs || now - ts > SOS_VISIBLE_WINDOW_MS) {
+                    RideBus.setGroupAlert(null)
+                    return
+                }
+                val lat = snapshot.child("latE7").getValue(Int::class.java)
+                val lon = snapshot.child("lonE7").getValue(Int::class.java)
+                val alert = GroupAlert(id, name, msg, ts, lat, lon)
                 RideBus.setGroupAlert(alert)
                 playServiceSosAlert(alert)
             }
@@ -433,10 +450,19 @@ class LiveLocationService : Service(), LocationListener {
             }
             override fun onCancelled(error: DatabaseError) = Unit
         }
+        removedListener = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                if (snapshot.getValue(Boolean::class.java) == true) {
+                    handleRemovedFromGroup()
+                }
+            }
+            override fun onCancelled(error: DatabaseError) = Unit
+        }
         root.child("events").child("sos").addValueEventListener(alertListener as ValueEventListener)
         root.child("events").child("regroup").addValueEventListener(regroupListener as ValueEventListener)
         root.child("settings").child("mode").addValueEventListener(modeListener as ValueEventListener)
         root.child("events").child("safetyCheck").addValueEventListener(safetyListener as ValueEventListener)
+        root.child("removed").child(riderId).addValueEventListener(removedListener as ValueEventListener)
     }
 
     private fun removeGroupEventListeners() {
@@ -446,10 +472,54 @@ class LiveLocationService : Service(), LocationListener {
         regroupListener?.let { root.child("events").child("regroup").removeEventListener(it) }
         modeListener?.let { root.child("settings").child("mode").removeEventListener(it) }
         safetyListener?.let { root.child("events").child("safetyCheck").removeEventListener(it) }
+        removedListener?.let { root.child("removed").child(riderId).removeEventListener(it) }
         alertListener = null
         regroupListener = null
         modeListener = null
         safetyListener = null
+        removedListener = null
+    }
+
+    private fun handleRemovedFromGroup() {
+        if (!running || rideRootPath.isBlank() || riderId.isBlank()) return
+        val root = FirebaseDatabase.getInstance().getReference(rideRootPath)
+        root.child("riders").child(riderId).removeValue()
+        root.child("admins").child(riderId).removeValue()
+        clearOwnSharedEvents(root)
+        WalkieTalkieSession.get(this).leave()
+        startService(Intent(this, WalkieForegroundService::class.java).setAction(WalkieForegroundService.ACTION_DISMISS))
+        val prefs = getSharedPreferences("ride", MODE_PRIVATE)
+        val localAdminGroups = prefs.getStringSet("admin_groups", emptySet()).orEmpty().toMutableSet()
+        localAdminGroups.remove(rideId)
+        prefs.edit()
+            .remove("active_group_code")
+            .putStringSet("admin_groups", localAdminGroups)
+            .apply()
+        RideBus.setGroupAlert(null)
+        RideBus.setRegroupPoint(null)
+        RideBus.setStatus("Removed from group by admin")
+        stopTracking(sendLeave = false)
+        stopSelf()
+    }
+
+    private fun clearOwnSharedEvents(root: com.google.firebase.database.DatabaseReference) {
+        root.child("events").child("sos").get().addOnSuccessListener { snapshot ->
+            if (snapshot.child("riderId").getValue(String::class.java) == riderId) {
+                snapshot.ref.removeValue()
+            }
+        }
+        root.child("events").child("regroup").get().addOnSuccessListener { snapshot ->
+            if (snapshot.child("riderId").getValue(String::class.java) == riderId) {
+                snapshot.ref.removeValue()
+            }
+        }
+        root.child("events").child("safetyCheck").get().addOnSuccessListener { snapshot ->
+            val target = snapshot.child("targetRiderId").getValue(String::class.java)
+            val first = snapshot.child("firstRiderId").getValue(String::class.java)
+            if (target == riderId || first == riderId) {
+                snapshot.ref.removeValue()
+            }
+        }
     }
 
     private fun publishSnapshot(snapshot: RiderSnapshot) {
@@ -500,17 +570,39 @@ class LiveLocationService : Service(), LocationListener {
 
     private fun publishSosFor(alertRiderId: String, alertRiderName: String, message: String) {
         if (!running || rideRootPath.isBlank()) return
-        val payload = mapOf(
+        val alertSnapshot = if (alertRiderId == riderId) {
+            lastOwnSnapshot
+        } else {
+            safetyRiders[alertRiderId]
+        }
+        val payload = mutableMapOf<String, Any>(
             "riderId" to alertRiderId,
             "riderName" to alertRiderName,
             "message" to message,
             "timestampMs" to System.currentTimeMillis()
         )
+        alertSnapshot?.let {
+            payload["latE7"] = it.latE7
+            payload["lonE7"] = it.lonE7
+        }
         FirebaseDatabase.getInstance().getReference(rideRootPath).child("events").child("sos").setValue(payload)
+    }
+
+    private fun clearSos() {
+        if (!running || rideRootPath.isBlank()) return
+        FirebaseDatabase.getInstance().getReference(rideRootPath).child("events").child("sos").removeValue()
+        RideBus.setGroupAlert(null)
+        RideBus.setStatus("SOS cleared")
     }
 
     private fun publishRegroup() {
         if (!running || rideRootPath.isBlank()) return
+        runIfGroupAdmin {
+            publishRegroupUnchecked()
+        }
+    }
+
+    private fun publishRegroupUnchecked() {
         val own = lastOwnSnapshot ?: return
         val payload = mapOf(
             "riderId" to riderId,
@@ -524,8 +616,45 @@ class LiveLocationService : Service(), LocationListener {
 
     private fun clearRegroup() {
         if (!running || rideRootPath.isBlank()) return
-        FirebaseDatabase.getInstance().getReference(rideRootPath).child("events").child("regroup").removeValue()
-        RideBus.setRegroupPoint(null)
+        runIfGroupAdmin {
+            FirebaseDatabase.getInstance().getReference(rideRootPath).child("events").child("regroup").removeValue()
+            RideBus.setRegroupPoint(null)
+        }
+    }
+
+    private fun runIfGroupAdmin(block: () -> Unit) {
+        if (isLocalAdminForRide()) {
+            FirebaseDatabase.getInstance()
+                .getReference(rideRootPath)
+                .child("admins")
+                .child(riderId)
+                .setValue(true)
+            block()
+            return
+        }
+        FirebaseDatabase.getInstance()
+            .getReference(rideRootPath)
+            .child("admins")
+            .child(riderId)
+            .get()
+            .addOnSuccessListener { snapshot ->
+                if (snapshot.getValue(Boolean::class.java) == true) {
+                    block()
+                } else {
+                    RideBus.setStatus("Only group admin can regroup riders")
+                }
+            }
+            .addOnFailureListener {
+                RideBus.setStatus("Admin check failed")
+            }
+    }
+
+    private fun isLocalAdminForRide(): Boolean {
+        if (rideId.isBlank()) return false
+        return getSharedPreferences("ride", MODE_PRIVATE)
+            .getStringSet("admin_groups", emptySet())
+            .orEmpty()
+            .contains(rideId)
     }
 
     private fun updateStationaryClock(location: Location, nowMs: Long) {
