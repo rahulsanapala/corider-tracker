@@ -57,6 +57,14 @@ class LiveLocationService : Service(), LocationListener {
     private var groupEventsStartedAtMs = 0L
     private var sosTone: ToneGenerator? = null
     private val handler = Handler(Looper.getMainLooper())
+    private val heartbeatRunnable = object : Runnable {
+        override fun run() {
+            publishHeartbeat()
+            if (running) {
+                handler.postDelayed(this, HEARTBEAT_INTERVAL_MS)
+            }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -75,6 +83,7 @@ class LiveLocationService : Service(), LocationListener {
             ACTION_CLEAR_REGROUP -> clearRegroup()
             ACTION_ACK_SAFETY -> acknowledgeSafety(intent.getStringExtra(EXTRA_SAFETY_CHECK_ID).orEmpty())
             ACTION_UPDATE_RIDER_NAME -> updateRiderName(intent.getStringExtra(EXTRA_RIDER_NAME).orEmpty())
+            ACTION_REFRESH -> refreshTracking()
             ACTION_SET_MODE -> {
                 val mode = intent.getStringExtra(EXTRA_MODE).orEmpty()
                 setMode(mode)
@@ -154,6 +163,7 @@ class LiveLocationService : Service(), LocationListener {
         startFirebaseListener()
         startGroupEventListeners()
         requestLocationUpdates()
+        startHeartbeat()
     }
 
     private fun requestLocationUpdates() {
@@ -161,6 +171,11 @@ class LiveLocationService : Service(), LocationListener {
             RideBus.setStatus("Location permission is not granted")
             stopSelf()
             return
+        }
+
+        try {
+            locationManager.removeUpdates(this)
+        } catch (_: Exception) {
         }
 
         val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
@@ -176,6 +191,20 @@ class LiveLocationService : Service(), LocationListener {
             locationManager.getLastKnownLocation(provider)?.let { onLocationChanged(it) }
         }
         RideBus.setStatus("Listening for GPS and Firebase updates")
+    }
+
+    private fun refreshTracking() {
+        if (!running) {
+            stopSelf()
+            return
+        }
+        requestLocationUpdates()
+        publishHeartbeat()
+    }
+
+    private fun startHeartbeat() {
+        handler.removeCallbacks(heartbeatRunnable)
+        handler.postDelayed(heartbeatRunnable, HEARTBEAT_INTERVAL_MS)
     }
 
     private fun startFirebaseListener() {
@@ -247,6 +276,40 @@ class LiveLocationService : Service(), LocationListener {
         }
     }
 
+    private fun publishHeartbeat() {
+        if (!running || rideRefPath.isBlank() || riderId.isBlank()) return
+        val base = lastOwnSnapshot ?: freshestLastKnownLocation()?.let { location ->
+            updateStationaryClock(location, System.currentTimeMillis())
+            RiderSnapshot.fromLocation(riderId, riderName, location, System.currentTimeMillis(), localStationarySinceMs)
+        } ?: return
+
+        val now = System.currentTimeMillis()
+        val heartbeatSnapshot = base.copy(
+            name = riderName,
+            updatedAtMs = now,
+            speedCentiMps = if (base.speedMps <= STATIONARY_SPEED_MPS) 0 else base.speedCentiMps
+        )
+        lastOwnSnapshot = heartbeatSnapshot
+        safetyRiders[riderId] = heartbeatSnapshot
+        RideBus.updateOwnLocation(heartbeatSnapshot)
+        publishExecutor?.execute {
+            runCatching {
+                publishSnapshot(heartbeatSnapshot)
+                RideBus.setStatus("Shared heartbeat for stationary location")
+            }.onFailure { error ->
+                RideBus.setStatus("Waiting for Firebase: ${error.message ?: "network error"}")
+            }
+        }
+    }
+
+    private fun freshestLastKnownLocation(): Location? {
+        if (!hasLocationPermission()) return null
+        return listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+            .filter { locationManager.isProviderEnabled(it) }
+            .mapNotNull { provider -> runCatching { locationManager.getLastKnownLocation(provider) }.getOrNull() }
+            .maxByOrNull { it.time }
+    }
+
     private fun hasLocationPermission(): Boolean {
         return checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
             checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
@@ -301,6 +364,7 @@ class LiveLocationService : Service(), LocationListener {
         const val ACTION_ACK_SAFETY = "com.corider.tracker.ACK_SAFETY"
         const val ACTION_SET_MODE = "com.corider.tracker.SET_MODE"
         const val ACTION_UPDATE_RIDER_NAME = "com.corider.tracker.UPDATE_RIDER_NAME"
+        const val ACTION_REFRESH = "com.corider.tracker.REFRESH"
         const val EXTRA_MODE = "update_mode"
         const val EXTRA_SAFETY_CHECK_ID = "safety_check_id"
 
@@ -311,6 +375,7 @@ class LiveLocationService : Service(), LocationListener {
         private const val SOS_NOTIFICATION_ID = 703
         private const val SAMPLE_INTERVAL_MS = 3_000L
         private const val SAMPLE_DISTANCE_M = 5f
+        private const val HEARTBEAT_INTERVAL_MS = 60_000L
         private const val STATIONARY_SPEED_MPS = 0.8
         private const val STATIONARY_REQUIRED_MS = 10 * 60 * 1000L
         private const val ACK_TIMEOUT_MS = 5 * 60 * 1000L

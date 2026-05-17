@@ -55,6 +55,13 @@ class LiveMapView(context: Context) : FrameLayout(context) {
         state.ownLocation?.let { moveCamera(it, zoomToTrackingLevel = true) }
     }
 
+    fun focusOnRider(riderId: String): Boolean {
+        val rider = state.riders[riderId] ?: return false
+        followOwnLocation = false
+        moveCamera(rider, zoomToTrackingLevel = true)
+        return true
+    }
+
     private fun render() {
         val own = state.ownLocation
         val now = System.currentTimeMillis()
