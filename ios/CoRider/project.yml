@@ -42,3 +42,12 @@ targets:
         product: RtcBasic
     entitlements:
       path: CoRider/CoRider.entitlements
+schemes:
+  CoRider:
+    build:
+      targets:
+        CoRider: all
+    run:
+      config: Debug
+    archive:
+      config: Release
