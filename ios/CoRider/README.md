@@ -28,7 +28,7 @@ The repo includes `.github/workflows/ios-build.yml` so GitHub can build the iOS 
 
 ### Build without Apple signing
 
-Push the code or run **Actions > iOS Build > Run workflow**. The `Build iOS simulator app` job creates a simulator artifact named `corider-ios-simulator-app`.
+Push the code or run **Actions > iOS Build > Run workflow** with `Build signed iPhone IPA` left unchecked. The `Build iOS simulator app` job creates a simulator artifact named `corider-ios-simulator-app`.
 
 This proves the iOS code compiles, but it cannot be installed on a physical iPhone.
 
@@ -46,7 +46,7 @@ To produce an installable `.ipa`, add these GitHub repository secrets:
 - `IOS_TEAM_ID`: Apple Developer Team ID.
 - `IOS_KEYCHAIN_PASSWORD`: any temporary password for the CI keychain.
 
-Then run **Actions > iOS Build > Run workflow**. The `Build signed iPhone IPA` job uploads `corider-ios-signed-ipa`.
+Then run **Actions > iOS Build > Run workflow** and check `Build signed iPhone IPA`. The `Build signed iPhone IPA` job uploads `corider-ios-signed-ipa`.
 
 On macOS, create the base64 values with:
 

@@ -11,6 +11,12 @@ on:
       - "ios/**"
       - ".github/workflows/ios-build.yml"
   workflow_dispatch:
+    inputs:
+      build_signed_ipa:
+        description: "Build signed iPhone IPA. Requires Apple signing secrets."
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   simulator:
@@ -79,7 +85,7 @@ jobs:
   signed-ipa:
     name: Build signed iPhone IPA
     runs-on: macos-latest
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_signed_ipa == true }}
 
     env:
       IOS_AGORA_APP_ID: ${{ secrets.IOS_AGORA_APP_ID }}
