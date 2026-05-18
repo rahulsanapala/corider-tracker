@@ -1,0 +1,4 @@
+// Copy this file to Config.xcconfig on your Mac.
+// Do not commit Config.xcconfig because it contains local credentials.
+AGORA_APP_ID = your_agora_app_id_here
+AGORA_TOKEN =

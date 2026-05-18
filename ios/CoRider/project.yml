@@ -1,0 +1,44 @@
+name: CoRider
+options:
+  bundleIdPrefix: com.corider
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: ""
+packages:
+  Firebase:
+    url: https://github.com/firebase/firebase-ios-sdk.git
+    from: 12.13.0
+  AgoraRtcEngine_iOS:
+    url: https://github.com/AgoraIO/AgoraRtcEngine_iOS.git
+    from: 4.6.2
+targets:
+  CoRider:
+    type: application
+    platform: iOS
+    sources:
+      - CoRider
+    info:
+      path: CoRider/Info.plist
+    configFiles:
+      Debug: Config.xcconfig
+      Release: Config.xcconfig
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.corider.tracker.ios
+        PRODUCT_NAME: CoRider
+        INFOPLIST_KEY_CFBundleDisplayName: CoRider
+        CODE_SIGN_STYLE: Automatic
+    dependencies:
+      - package: Firebase
+        product: FirebaseCore
+      - package: Firebase
+        product: FirebaseAuth
+      - package: Firebase
+        product: FirebaseDatabase
+      - package: AgoraRtcEngine_iOS
+        product: RtcBasic
+    entitlements:
+      path: CoRider/CoRider.entitlements

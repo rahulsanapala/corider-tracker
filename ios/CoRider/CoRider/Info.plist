@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AgoraAppId</key>
+	<string>$(AGORA_APP_ID)</string>
+	<key>AgoraToken</key>
+	<string>$(AGORA_TOKEN)</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>CoRider uses your location to show live rider positions to your active group.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>CoRider can keep sharing your ride location while the phone is locked.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>CoRider uses the microphone for group walkie talkie.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+		<string>location</string>
+	</array>
+</dict>
+</plist>

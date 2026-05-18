@@ -5,6 +5,12 @@ local.properties
 
 app/build/
 app/google-services.json
+ios/**/GoogleService-Info.plist
+ios/**/Config.xcconfig
+ios/**/DerivedData/
+ios/**/.build/
+ios/**/*.xcworkspace/
+ios/**/*.xcuserdata/
 
 *.apk
 *.aab
