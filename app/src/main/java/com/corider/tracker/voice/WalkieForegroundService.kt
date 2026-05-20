@@ -14,7 +14,7 @@ class WalkieForegroundService : Service() {
         when (intent?.action) {
             ACTION_TOGGLE_TALK -> {
                 val state = walkie.currentState()
-                if (state.joined) {
+                if (state.joined && !state.onHold) {
                     walkie.setTalking(!state.talking)
                 }
                 showOrStop(walkie.currentState())

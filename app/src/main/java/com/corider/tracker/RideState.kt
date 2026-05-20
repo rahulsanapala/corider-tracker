@@ -38,6 +38,24 @@ data class RegroupPoint(
     val longitude: Double get() = lonE7 / 10_000_000.0
 }
 
+data class BikeEvent(
+    val id: String,
+    val name: String,
+    val eventTime: String,
+    val startAtMs: Long,
+    val locationName: String,
+    val description: String,
+    val latE7: Int,
+    val lonE7: Int,
+    val creatorName: String,
+    val createdAtMs: Long,
+    val creatorId: String = "",
+    val creatorEmail: String = ""
+) {
+    val latitude: Double get() = latE7 / 10_000_000.0
+    val longitude: Double get() = lonE7 / 10_000_000.0
+}
+
 data class SafetyCheck(
     val id: String,
     val targetRiderId: String,

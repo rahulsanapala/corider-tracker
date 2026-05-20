@@ -13,11 +13,13 @@ import android.os.SystemClock
 import android.view.View
 import android.widget.FrameLayout
 import android.widget.ImageView
+import com.corider.tracker.BikeEvent
 import com.corider.tracker.GroupAlert
 import com.corider.tracker.R
 import com.corider.tracker.RegroupPoint
 import com.corider.tracker.RideState
 import com.corider.tracker.RiderSnapshot
+import com.corider.tracker.navigation.NavigationPoint
 import org.osmdroid.config.Configuration
 import org.osmdroid.events.MapListener
 import org.osmdroid.events.ScrollEvent
@@ -45,13 +47,17 @@ class LiveMapView(context: Context) : FrameLayout(context) {
     private var ownMarker: Marker? = null
     private var regroupMarker: Marker? = null
     private var sosMarker: Marker? = null
+    private var destinationMarker: Marker? = null
+    private var routeLine: Polyline? = null
     private var temporaryRiderMarker: Marker? = null
+    private val eventMarkers = LinkedHashMap<String, Marker>()
     private var temporaryRiderSnapshot: RiderSnapshot? = null
     private var accuracyCircle: Polygon? = null
     private var state = RideState()
     private var followOwnLocation = true
     private val interpolator = android.view.animation.AccelerateDecelerateInterpolator()
     var onSosMarkerClick: ((GroupAlert) -> Unit)? = null
+    var onEventMarkerClick: ((BikeEvent) -> Unit)? = null
 
     init {
         Configuration.getInstance().userAgentValue = context.packageName
@@ -123,6 +129,92 @@ class LiveMapView(context: Context) : FrameLayout(context) {
         temporaryRiderMarker?.let { mapView.overlays.remove(it) }
         temporaryRiderMarker = null
         mapView.invalidate()
+    }
+
+    fun showDestination(name: String, latitude: Double, longitude: Double) {
+        val point = GeoPoint(latitude, longitude)
+        destinationMarker = destinationMarker ?: Marker(mapView).also {
+            it.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+            it.icon = destinationPinDrawable()
+            mapView.overlays.add(it)
+        }
+        destinationMarker?.apply {
+            position = point
+            title = name
+            subDescription = "Destination"
+        }
+        followOwnLocation = false
+        if (mapView.zoomLevelDouble < TRACKING_ZOOM) {
+            mapView.controller.setZoom(TRACKING_ZOOM)
+        }
+        mapView.controller.animateTo(point)
+        mapView.invalidate()
+    }
+
+    fun showRoute(points: List<NavigationPoint>) {
+        if (points.isEmpty()) return
+        val geoPoints = points.map { GeoPoint(it.latitude, it.longitude) }
+        val line = routeLine ?: Polyline().also {
+            it.outlinePaint.color = Color.rgb(37, 99, 235)
+            it.outlinePaint.strokeWidth = 8f
+            it.outlinePaint.strokeCap = Paint.Cap.ROUND
+            it.outlinePaint.strokeJoin = Paint.Join.ROUND
+            routeLine = it
+            mapView.overlays.add(0, it)
+        }
+        line.setPoints(geoPoints)
+        mapView.invalidate()
+    }
+
+    fun clearNavigation() {
+        destinationMarker?.let { mapView.overlays.remove(it) }
+        routeLine?.let { mapView.overlays.remove(it) }
+        destinationMarker = null
+        routeLine = null
+        mapView.invalidate()
+    }
+
+    fun setGlobalEvents(events: Collection<BikeEvent>, show: Boolean) {
+        if (!show) {
+            clearEventMarkers()
+            return
+        }
+
+        val visibleEvents = events.associateBy { it.id }
+        val removedIds = eventMarkers.keys - visibleEvents.keys
+        removedIds.forEach { id ->
+            eventMarkers.remove(id)?.let { mapView.overlays.remove(it) }
+        }
+
+        visibleEvents.values.forEach { event ->
+            val marker = eventMarkers[event.id] ?: Marker(mapView).also {
+                it.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                it.icon = eventPinDrawable(event.id)
+                mapView.overlays.add(it)
+                eventMarkers[event.id] = it
+            }
+            marker.position = GeoPoint(event.latitude, event.longitude)
+            marker.title = event.name
+            marker.subDescription = listOf(event.eventTime, event.locationName)
+                .filter { it.isNotBlank() }
+                .joinToString(" - ")
+            marker.setOnMarkerClickListener { _, _ ->
+                onEventMarkerClick?.invoke(event)
+                true
+            }
+        }
+        mapView.invalidate()
+    }
+
+    fun focusOnEvent(eventId: String): Boolean {
+        val marker = eventMarkers[eventId] ?: return false
+        followOwnLocation = false
+        if (mapView.zoomLevelDouble < TRACKING_ZOOM) {
+            mapView.controller.setZoom(TRACKING_ZOOM)
+        }
+        mapView.controller.animateTo(marker.position)
+        marker.showInfoWindow()
+        return true
     }
 
     fun focusOnSos(): Boolean {
@@ -419,6 +511,76 @@ class LiveMapView(context: Context) : FrameLayout(context) {
         return BitmapDrawable(resources, bitmap)
     }
 
+    private fun eventPinDrawable(eventId: String): BitmapDrawable {
+        val size = EVENT_PIN_SIZE_DP.dp()
+        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        val cx = size / 2f
+        val headCy = size * 0.34f
+        val headR = size * 0.28f
+        val color = EVENT_COLORS[(eventId.hashCode() and Int.MAX_VALUE) % EVENT_COLORS.size]
+
+        paint.color = Color.argb(85, 0, 0, 0)
+        canvas.drawOval(size * 0.32f, size * 0.88f, size * 0.68f, size * 0.97f, paint)
+
+        paint.color = color
+        val pin = Path().apply {
+            moveTo(cx, size - 3f)
+            cubicTo(size * 0.18f, size * 0.58f, size * 0.12f, size * 0.2f, cx, size * 0.05f)
+            cubicTo(size * 0.88f, size * 0.2f, size * 0.82f, size * 0.58f, cx, size - 3f)
+            close()
+        }
+        canvas.drawPath(pin, paint)
+
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = size * 0.035f
+        paint.color = Color.BLACK
+        canvas.drawPath(pin, paint)
+        paint.style = Paint.Style.FILL
+
+        paint.color = Color.WHITE
+        canvas.drawCircle(cx, headCy, headR, paint)
+        paint.color = Color.rgb(17, 24, 39)
+        paint.typeface = Typeface.DEFAULT_BOLD
+        paint.textAlign = Paint.Align.CENTER
+        paint.textSize = size * 0.22f
+        val textY = headCy - (paint.descent() + paint.ascent()) / 2f
+        canvas.drawText("E", cx, textY, paint)
+        return BitmapDrawable(resources, bitmap)
+    }
+
+    private fun destinationPinDrawable(): BitmapDrawable {
+        val size = DESTINATION_PIN_SIZE_DP.dp()
+        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        val cx = size / 2f
+        val headCy = size * 0.34f
+        val headR = size * 0.28f
+
+        paint.color = Color.rgb(245, 158, 11)
+        val pin = Path().apply {
+            moveTo(cx, size - 3f)
+            cubicTo(size * 0.18f, size * 0.58f, size * 0.12f, size * 0.2f, cx, size * 0.05f)
+            cubicTo(size * 0.88f, size * 0.2f, size * 0.82f, size * 0.58f, cx, size - 3f)
+            close()
+        }
+        canvas.drawPath(pin, paint)
+
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = size * 0.035f
+        paint.color = Color.BLACK
+        canvas.drawPath(pin, paint)
+        paint.style = Paint.Style.FILL
+
+        paint.color = Color.WHITE
+        canvas.drawCircle(cx, headCy, headR, paint)
+        paint.color = Color.rgb(17, 24, 39)
+        canvas.drawCircle(cx, headCy, headR * 0.46f, paint)
+        return BitmapDrawable(resources, bitmap)
+    }
+
     private fun riderPinDrawable(riderId: String, riderName: String, ownRider: Boolean): BitmapDrawable {
         val initials = riderInitials(riderName, riderId)
         val color = riderColor(riderId, ownRider)
@@ -518,12 +680,20 @@ class LiveMapView(context: Context) : FrameLayout(context) {
         return a.distanceToAsDouble(b)
     }
 
+    private fun clearEventMarkers() {
+        eventMarkers.values.forEach { mapView.overlays.remove(it) }
+        eventMarkers.clear()
+        mapView.invalidate()
+    }
+
     companion object {
         private const val MAX_TRAIL_POINTS = 30
         private const val MIN_TRAIL_POINT_DISTANCE_M = 4.0
         private const val TRACKING_ZOOM = 16.0
         private const val SOS_PIN_SIZE_DP = 58
         private const val RIDER_PIN_SIZE_DP = 58
+        private const val DESTINATION_PIN_SIZE_DP = 58
+        private const val EVENT_PIN_SIZE_DP = 54
         private const val ARROW_SIZE_DP = 42
         private const val EDGE_ARROW_MARGIN_DP = 34
         private const val MAX_RIDER_ICON_CACHE = 80
@@ -538,6 +708,13 @@ class LiveMapView(context: Context) : FrameLayout(context) {
             Color.rgb(234, 179, 8),
             Color.rgb(249, 115, 22),
             Color.rgb(100, 116, 139)
+        )
+        private val EVENT_COLORS = intArrayOf(
+            Color.rgb(245, 158, 11),
+            Color.rgb(168, 85, 247),
+            Color.rgb(14, 165, 233),
+            Color.rgb(236, 72, 153),
+            Color.rgb(34, 197, 94)
         )
     }
 

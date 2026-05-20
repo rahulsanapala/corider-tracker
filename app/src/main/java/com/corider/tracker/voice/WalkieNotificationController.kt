@@ -37,12 +37,13 @@ object WalkieNotificationController {
         val talkTitle = if (state.talking) "Stop Talk" else "Talk"
         val talkIcon = if (state.talking) R.drawable.ic_mic_off else R.drawable.ic_mic
         val contentText = when {
+            state.onHold -> "On hold during phone call"
             state.talking -> "Talking in ${state.groupCode}"
             state.joined -> "Listening in ${state.groupCode}"
             else -> state.message
         }
 
-        return Notification.Builder(appContext, CHANNEL_ID)
+        val builder = Notification.Builder(appContext, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_ride_notification)
             .setContentTitle("CoRider walkie talkie")
             .setContentText(contentText)
@@ -54,6 +55,8 @@ object WalkieNotificationController {
             .setCategory(Notification.CATEGORY_CALL)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setPriority(Notification.PRIORITY_HIGH)
+        if (!state.onHold) {
+            builder
             .addAction(
                 Notification.Action.Builder(
                     talkIcon,
@@ -61,6 +64,8 @@ object WalkieNotificationController {
                     serviceIntent(appContext, WalkieForegroundService.ACTION_TOGGLE_TALK)
                 ).build()
             )
+        }
+        return builder
             .addAction(
                 Notification.Action.Builder(
                     R.drawable.ic_call_end,

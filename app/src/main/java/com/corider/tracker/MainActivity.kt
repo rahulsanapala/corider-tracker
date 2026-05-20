@@ -3,6 +3,8 @@
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.DatePickerDialog
+import android.app.TimePickerDialog
 import android.content.Context
 import android.content.Intent
 import android.content.res.ColorStateList
@@ -17,6 +19,7 @@ import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.CancellationSignal
 import android.os.PowerManager
 import android.provider.Settings
 import android.text.Editable
@@ -33,6 +36,7 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -44,27 +48,60 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
+import androidx.credentials.CredentialManager
+import androidx.credentials.CredentialManagerCallback
+import androidx.credentials.CustomCredential
+import androidx.credentials.GetCredentialRequest
+import androidx.credentials.GetCredentialResponse
+import androidx.credentials.exceptions.GetCredentialException
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import com.corider.tracker.location.LiveLocationService
+import com.corider.tracker.navigation.MapNavigationClient
+import com.corider.tracker.navigation.PlaceSearchResult
+import com.corider.tracker.navigation.RouteResult
 import com.corider.tracker.ui.LiveMapView
 import com.corider.tracker.voice.AgoraWalkieTalkie
 import com.corider.tracker.voice.WalkieForegroundService
 import com.corider.tracker.voice.WalkieTalkieSession
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.bottomnavigation.BottomNavigationView
+import com.google.android.libraries.identity.googleid.GetGoogleIdOption
+import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.FirebaseUser
+import com.google.firebase.auth.GoogleAuthProvider
+import com.google.firebase.database.DataSnapshot
+import com.google.firebase.database.DatabaseError
 import com.google.firebase.database.DatabaseReference
 import com.google.firebase.database.FirebaseDatabase
+import com.google.firebase.database.ValueEventListener
+import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.Executor
+import java.util.concurrent.Executors
+import kotlin.math.roundToInt
+import org.osmdroid.config.Configuration
+import org.osmdroid.events.MapEventsReceiver
+import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.util.GeoPoint
+import org.osmdroid.views.MapView as OsmMapView
+import org.osmdroid.views.overlay.MapEventsOverlay
+import org.osmdroid.views.overlay.Marker
 
 class MainActivity : Activity(), RideBus.Listener {
     private lateinit var rideCodeInput: EditText
     private lateinit var profileNameInput: EditText
     private lateinit var profileContactInput: EditText
+    private lateinit var profileDobInput: EditText
     private lateinit var profileBloodInput: Spinner
     private lateinit var profileBikeInput: EditText
     private lateinit var profileEmergencyInput: EditText
+    private lateinit var profileTitleView: TextView
+    private lateinit var profileSubtitleView: TextView
+    private lateinit var googleAuthStatusView: TextView
+    private lateinit var googleAuthButton: Button
     private lateinit var batteryStatusView: TextView
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
@@ -77,6 +114,10 @@ class MainActivity : Activity(), RideBus.Listener {
     private lateinit var sosButton: Button
     private lateinit var regroupButton: Button
     private lateinit var sosSafeButton: ImageButton
+    private lateinit var mapSearchPanel: LinearLayout
+    private lateinit var destinationSearchInput: EditText
+    private lateinit var routeInfoPill: TextView
+    private lateinit var clearRouteButton: ImageButton
     private lateinit var modeEcoButton: TextView
     private lateinit var modeNormalButton: TextView
     private lateinit var modeFastButton: TextView
@@ -95,6 +136,13 @@ class MainActivity : Activity(), RideBus.Listener {
     private lateinit var groupScroll: ScrollView
     private lateinit var groupContent: LinearLayout
     private lateinit var groupResultsContent: LinearLayout
+    private lateinit var eventsPage: SwipeRefreshLayout
+    private lateinit var eventsScroll: ScrollView
+    private lateinit var eventsContent: LinearLayout
+    private lateinit var eventNameInput: EditText
+    private lateinit var eventTimeInput: EditText
+    private lateinit var eventLocationInput: EditText
+    private lateinit var eventDescriptionInput: EditText
     private lateinit var profilePage: ScrollView
 
     private lateinit var totalRidersCard: TextView
@@ -109,7 +157,7 @@ class MainActivity : Activity(), RideBus.Listener {
     private lateinit var bottomNav: BottomNavigationView
 
     private val prefs by lazy { getSharedPreferences("ride", Context.MODE_PRIVATE) }
-    private val riderId by lazy { getOrCreateRiderId() }
+    private val riderId: String get() = currentRiderIdentityId()
     private val walkieTalkie by lazy { WalkieTalkieSession.get(this) }
     private var pendingStart = false
     private var pendingWalkieGroup: String? = null
@@ -139,16 +187,35 @@ class MainActivity : Activity(), RideBus.Listener {
     private val adminRoleLoading = mutableSetOf<String>()
     private val adminRoleFetchedAtMs = mutableMapOf<String, Long>()
     private var selectedRiderActionId: String? = null
+    private val mapNavigationClient = MapNavigationClient()
+    private val mapNavigationExecutor = Executors.newSingleThreadExecutor()
+    private var selectedDestination: PlaceSearchResult? = null
+    private var pendingRouteDestination: PlaceSearchResult? = null
+    private var mapNavigationRequestId = 0
+    private var routeInProgress = false
+    private var globalEventsListener: ValueEventListener? = null
+    private val globalBikeEvents = LinkedHashMap<String, BikeEvent>()
+    private var eventCreateExpanded = false
+    private var selectedEventStartAtMs = 0L
+    private var selectedEventLocationName = ""
+    private var selectedEventLatE7: Int? = null
+    private var selectedEventLonE7: Int? = null
+    private var eventLocationRequestId = 0
+    private lateinit var credentialManager: CredentialManager
+    private val mainThreadExecutor = Executor { command -> runOnUiThread(command) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         super.onCreate(savedInstanceState)
+        credentialManager = CredentialManager.create(this)
+        resetLegacyIdentityDataIfNeeded()
         adminGroups.addAll(loadLocalAdminGroups())
         walkieTalkie.onStateChanged = { state ->
             syncWalkieForeground(state)
             runOnUiThread { renderWalkieState(state) }
         }
         buildUi()
+        startGlobalEventsListener()
         handleJoinIntent(intent)
     }
 
@@ -192,10 +259,12 @@ class MainActivity : Activity(), RideBus.Listener {
 
     override fun onDestroy() {
         stopPreviewLocation()
+        stopGlobalEventsListener()
         if (::mapPage.isInitialized) mapPage.removeCallbacks(hideRiderDetailRunnable)
         walkieTalkie.onStateChanged = null
         WalkieTalkieSession.releaseIfIdle(this)
         if (::mapView.isInitialized) mapView.onDestroy()
+        mapNavigationExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -249,13 +318,15 @@ class MainActivity : Activity(), RideBus.Listener {
         }
         mapPage = buildMapPage()
         groupPage = buildGroupPage()
+        eventsPage = buildEventsPage()
         profilePage = buildProfilePage()
         contentFrame.addView(mapPage, FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
         contentFrame.addView(groupPage, FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+        contentFrame.addView(eventsPage, FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
         contentFrame.addView(profilePage, FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
         root.addView(contentFrame, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
-        root.addView(buildBottomNav(), LinearLayout.LayoutParams.MATCH_PARENT, dp(76))
+        root.addView(buildBottomNav(), LinearLayout.LayoutParams.MATCH_PARENT, dp(64))
 
         setContentView(root)
         switchTab("map")
@@ -310,11 +381,24 @@ class MainActivity : Activity(), RideBus.Listener {
                 showSosAlertDetail(currentState, alert, System.currentTimeMillis(), force = true)
                 focusOnSos()
             }
+            onEventMarkerClick = { event ->
+                openEventDetailsFromMap(event)
+            }
         }
 
         return FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             addView(mapView, FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+            mapSearchPanel = buildMapSearchPanel()
+            addView(
+                mapSearchPanel,
+                FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT).apply {
+                    gravity = Gravity.TOP
+                    leftMargin = dp(18)
+                    rightMargin = dp(18)
+                    topMargin = dp(22)
+                }
+            )
 
             livePill = TextView(this@MainActivity).apply {
                 text = "Live  Ready"
@@ -483,6 +567,92 @@ class MainActivity : Activity(), RideBus.Listener {
                     topMargin = dp(188)
                 }
             )
+            mapSearchPanel.bringToFront()
+        }
+    }
+
+    private fun buildMapSearchPanel(): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+
+            val searchRow = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(12), 0, dp(8), 0)
+                background = rounded(Color.rgb(255, 255, 255), dp(26), stroke = Color.rgb(15, 23, 42))
+                elevation = dp(12).toFloat()
+            }
+
+            searchRow.addView(
+                ImageView(this@MainActivity).apply {
+                    setImageResource(R.drawable.ic_search)
+                    setColorFilter(Color.rgb(71, 85, 105))
+                    scaleType = ImageView.ScaleType.CENTER
+                },
+                LinearLayout.LayoutParams(dp(24), dp(52))
+            )
+
+            destinationSearchInput = EditText(this@MainActivity).apply {
+                hint = "Search destination"
+                setHintTextColor(Color.rgb(100, 116, 139))
+                setTextColor(Color.rgb(15, 23, 42))
+                textSize = 15f
+                setSingleLine(true)
+                background = null
+                inputType = InputType.TYPE_CLASS_TEXT
+                imeOptions = EditorInfo.IME_ACTION_SEARCH
+                setPadding(dp(10), 0, dp(8), 0)
+                setOnEditorActionListener { _, actionId, _ ->
+                    if (actionId == EditorInfo.IME_ACTION_SEARCH) {
+                        searchMapDestination()
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
+            searchRow.addView(destinationSearchInput, LinearLayout.LayoutParams(0, dp(52), 1f))
+
+            clearRouteButton = ImageButton(this@MainActivity).apply {
+                contentDescription = "Clear directions"
+                setImageResource(R.drawable.ic_close)
+                setColorFilter(Color.rgb(71, 85, 105))
+                scaleType = ImageView.ScaleType.CENTER
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+                background = oval(Color.TRANSPARENT)
+                visibility = View.GONE
+                setOnClickListener { clearMapDirections() }
+            }
+            searchRow.addView(clearRouteButton, LinearLayout.LayoutParams(dp(44), dp(52)))
+
+            searchRow.addView(
+                ImageButton(this@MainActivity).apply {
+                    contentDescription = "Search destination"
+                    setImageResource(R.drawable.ic_directions)
+                    setColorFilter(Color.WHITE)
+                    scaleType = ImageView.ScaleType.CENTER
+                    setPadding(dp(10), dp(10), dp(10), dp(10))
+                    background = oval(BLUE)
+                    setOnClickListener { searchMapDestination() }
+                },
+                LinearLayout.LayoutParams(dp(42), dp(42))
+            )
+
+            addView(searchRow, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52)))
+
+            routeInfoPill = TextView(this@MainActivity).apply {
+                text = ""
+                textSize = 13f
+                setTextColor(Color.rgb(15, 23, 42))
+                setPadding(dp(14), dp(10), dp(14), dp(10))
+                background = rounded(Color.rgb(239, 246, 255), dp(12), stroke = Color.rgb(37, 99, 235))
+                elevation = dp(8).toFloat()
+                visibility = View.GONE
+                setOnClickListener {
+                    selectedDestination?.let { requestRouteToDestination(it) }
+                }
+            }
+            addView(routeInfoPill, matchWrap(top = 8))
         }
     }
 
@@ -585,6 +755,782 @@ class MainActivity : Activity(), RideBus.Listener {
         }
     }
 
+    private fun buildEventsPage(): SwipeRefreshLayout {
+        eventsContent = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(18), dp(18), dp(24))
+            setBackgroundColor(SURFACE)
+        }
+        renderEventsPage()
+
+        eventsScroll = ScrollView(this).apply {
+            setBackgroundColor(SURFACE)
+            clipToPadding = false
+            isFillViewport = true
+            addView(eventsContent)
+        }
+
+        return SwipeRefreshLayout(this).apply {
+            setColorSchemeColors(BLUE, GREEN, AMBER)
+            setProgressBackgroundColorSchemeColor(PANEL)
+            setOnRefreshListener { refreshEventsPage() }
+            addView(eventsScroll, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+    }
+
+    private fun refreshEventsPage() {
+        renderEventsPage()
+        withFirebaseAuth {
+            globalEventsRef().get()
+                .addOnSuccessListener { snapshot ->
+                    applyGlobalEventsSnapshot(snapshot)
+                    statusView.text = "Events refreshed."
+                }
+                .addOnFailureListener { error ->
+                    statusView.text = "Events refresh failed: ${error.message ?: "network error"}"
+                }
+                .addOnCompleteListener {
+                    if (::eventsPage.isInitialized) eventsPage.post { eventsPage.isRefreshing = false }
+                }
+        }
+    }
+
+    private fun renderEventsPage() {
+        if (!::eventsContent.isInitialized) return
+        eventsContent.removeAllViews()
+
+        val hero = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = gradientRounded(Color.rgb(88, 28, 135), Color.rgb(14, 116, 144), dp(18), stroke = Color.rgb(147, 197, 253))
+            elevation = dp(5).toFloat()
+        }
+        hero.addView(TextView(this).apply {
+            text = "Global Bike Events"
+            textSize = 22f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        }, matchWrapNoMargin())
+        hero.addView(TextView(this).apply {
+            text = "Create rides, meetups, and bike events for everyone using CoRider."
+            textSize = 13f
+            setTextColor(Color.rgb(219, 234, 254))
+            setPadding(0, dp(6), 0, 0)
+            setLineSpacing(dp(2).toFloat(), 1.0f)
+        }, matchWrapNoMargin())
+        eventsContent.addView(hero, matchWrapNoMargin())
+        eventsContent.addView(createEventPanel(), matchWrap(top = 16))
+
+        val events = globalBikeEvents.values.sortedWith(
+            compareBy<BikeEvent> { event -> event.startAtMs.takeIf { it > 0L } ?: Long.MAX_VALUE }
+                .thenByDescending { it.createdAtMs }
+        )
+        if (events.isEmpty()) {
+            val empty = panel()
+            empty.addView(sectionTitle("NO EVENTS YET"), matchWrapNoMargin())
+            empty.addView(bodyText("Create the first ride or meetup. Event pins will appear on the map in Preview / Only you mode."), matchWrap(top = 8))
+            eventsContent.addView(empty, matchWrap(top = 16))
+            return
+        }
+
+        eventsContent.addView(sectionHeaderWithIcon(R.drawable.ic_nav_events, AMBER, "UPCOMING & COMMUNITY EVENTS"), matchWrap(top = 18))
+        events.forEach { event ->
+            eventsContent.addView(bikeEventCard(event), matchWrap(top = 12))
+        }
+    }
+
+    private fun createEventPanel(): LinearLayout {
+        val panel = panel()
+        if (!eventCreateExpanded) {
+            panel.addView(smallCommand("CREATE EVENT", BLUE).apply {
+                setOnClickListener {
+                    eventCreateExpanded = true
+                    renderEventsPage()
+                    if (::eventsScroll.isInitialized) eventsScroll.post { eventsScroll.smoothScrollTo(0, 0) }
+                }
+            }, matchWrapNoMargin())
+            return panel
+        }
+
+        panel.addView(sectionTitle("CREATE EVENT DETAILS"), matchWrapNoMargin())
+        eventNameInput = input("Event name", "").apply {
+            filters = arrayOf(InputFilter.LengthFilter(60))
+        }
+        eventTimeInput = input("Start date & time", "").apply {
+            inputType = InputType.TYPE_NULL
+            keyListener = null
+            isFocusable = false
+            isCursorVisible = false
+            isClickable = true
+            setOnClickListener { showEventStartPicker() }
+        }
+        eventLocationInput = input("Add location", selectedEventLocationName).apply {
+            inputType = InputType.TYPE_NULL
+            keyListener = null
+            isFocusable = false
+            isCursorVisible = false
+            isClickable = true
+            setOnClickListener { showEventLocationPicker() }
+        }
+        eventDescriptionInput = EditText(this).apply {
+            hint = "Description"
+            setHintTextColor(MUTED)
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            minLines = 3
+            maxLines = 5
+            gravity = Gravity.TOP
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = rounded(INPUT, dp(8), stroke = CARD_STROKE)
+            filters = arrayOf(InputFilter.LengthFilter(240))
+        }
+        panel.addView(eventNameInput, matchWrap(top = 12))
+        panel.addView(eventTimeInput, matchWrap(top = 10))
+        panel.addView(eventLocationInput, matchWrap(top = 10))
+        panel.addView(eventDescriptionInput, matchWrap(top = 10))
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        actions.addView(smallCommand("CANCEL", PILL).apply {
+            setOnClickListener {
+                resetEventCreateForm()
+                eventCreateExpanded = false
+                renderEventsPage()
+            }
+        }, LinearLayout.LayoutParams(0, dp(48), 1f))
+        actions.addView(smallCommand("PUBLISH", BLUE).apply {
+            setOnClickListener { createGlobalEvent() }
+        }, LinearLayout.LayoutParams(0, dp(48), 1f).apply { leftMargin = dp(10) })
+        panel.addView(actions, matchWrap(top = 12))
+        return panel
+    }
+
+    private fun bikeEventCard(event: BikeEvent): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            background = gradientRounded(eventGradientStart(event.id), eventGradientEnd(event.id), dp(16), stroke = Color.argb(120, 255, 255, 255))
+            elevation = dp(6).toFloat()
+            isClickable = true
+            setOnClickListener { showEventDetailsDialog(event) }
+
+            val topRow = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            val titleColumn = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(TextView(this@MainActivity).apply {
+                    text = event.name
+                    textSize = 20f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(Color.WHITE)
+                    maxLines = 2
+                }, matchWrapNoMargin())
+                addView(TextView(this@MainActivity).apply {
+                    text = event.locationName.ifBlank { event.creatorName.ifBlank { "Event location" } }
+                    textSize = 12f
+                    setTextColor(Color.rgb(226, 232, 240))
+                    setPadding(0, dp(3), 0, 0)
+                    maxLines = 2
+                }, matchWrapNoMargin())
+            }
+            topRow.addView(titleColumn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            topRow.addView(TextView(this@MainActivity).apply {
+                text = event.eventTime.ifBlank { "TIME" }
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                setTextColor(Color.rgb(15, 23, 42))
+                setPadding(dp(10), dp(8), dp(10), dp(8))
+                background = rounded(Color.WHITE, dp(10))
+                maxLines = 2
+            }, LinearLayout.LayoutParams(dp(96), ViewGroup.LayoutParams.WRAP_CONTENT).apply { leftMargin = dp(12) })
+            addView(topRow, matchWrapNoMargin())
+
+            addView(TextView(this@MainActivity).apply {
+                text = event.description.ifBlank { "No description added." }
+                textSize = 14f
+                setTextColor(Color.rgb(248, 250, 252))
+                setPadding(0, dp(14), 0, 0)
+                setLineSpacing(dp(2).toFloat(), 1.0f)
+                maxLines = 4
+            }, matchWrapNoMargin())
+
+            addView(TextView(this@MainActivity).apply {
+                text = "VIEW DETAILS"
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                setTextColor(Color.rgb(15, 23, 42))
+                setPadding(dp(14), dp(10), dp(14), dp(10))
+                background = rounded(Color.WHITE, dp(12))
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(14) })
+        }
+    }
+
+    private fun createGlobalEvent() {
+        if (!requireGoogleIdentity("create events")) return
+        val name = eventNameInput.text.toString().trim()
+        val startAtMs = selectedEventStartAtMs
+        val time = if (startAtMs > 0L) formatEventStartTime(startAtMs) else eventTimeInput.text.toString().trim()
+        val description = eventDescriptionInput.text.toString().trim()
+        val latE7 = selectedEventLatE7
+        val lonE7 = selectedEventLonE7
+
+        if (name.isBlank()) {
+            eventNameInput.error = "Event name is required"
+            statusView.text = "Enter event name."
+            return
+        }
+        if (startAtMs <= 0L || time.isBlank()) {
+            eventTimeInput.error = "Select start date and time"
+            statusView.text = "Select event start date and time."
+            return
+        }
+        if (startAtMs < System.currentTimeMillis() - 60_000L) {
+            eventTimeInput.error = "Start time cannot be in the past"
+            statusView.text = "Select a future event start time."
+            return
+        }
+        if (selectedEventLocationName.isBlank() || latE7 == null || lonE7 == null) {
+            eventLocationInput.error = "Add event location"
+            statusView.text = "Add event location."
+            return
+        }
+        if (description.isBlank()) {
+            eventDescriptionInput.error = "Description is required"
+            statusView.text = "Enter event description."
+            return
+        }
+
+        withFirebaseAuth {
+            val authUser = FirebaseAuth.getInstance().currentUser
+            val creatorId = currentGoogleUid().orEmpty()
+            val creatorEmail = authUser?.email.orEmpty().trim().lowercase(Locale.US)
+            val id = "EVT-${UUID.randomUUID().toString().take(8).uppercase(Locale.US)}"
+            val event = BikeEvent(
+                id = id,
+                name = name,
+                eventTime = time,
+                startAtMs = startAtMs,
+                locationName = selectedEventLocationName,
+                description = description,
+                latE7 = latE7,
+                lonE7 = lonE7,
+                creatorName = profileName(),
+                createdAtMs = System.currentTimeMillis(),
+                creatorId = creatorId,
+                creatorEmail = creatorEmail
+            )
+            globalEventsRef().child(id).setValue(
+                mapOf(
+                    "id" to event.id,
+                    "name" to event.name,
+                    "eventTime" to event.eventTime,
+                    "startAtMs" to event.startAtMs,
+                    "locationName" to event.locationName,
+                    "description" to event.description,
+                    "latE7" to event.latE7,
+                    "lonE7" to event.lonE7,
+                    "creatorName" to event.creatorName,
+                    "creatorId" to event.creatorId,
+                    "creatorUid" to event.creatorId,
+                    "localRiderId" to riderId,
+                    "creatorEmail" to event.creatorEmail,
+                    "createdAtMs" to event.createdAtMs
+                )
+            ).addOnSuccessListener {
+                eventNameInput.text?.clear()
+                eventTimeInput.text?.clear()
+                eventLocationInput.text?.clear()
+                eventDescriptionInput.text?.clear()
+                resetEventCreateForm()
+                eventCreateExpanded = false
+                renderEventsPage()
+                hideKeyboard(eventDescriptionInput)
+                statusView.text = "Event created."
+            }.addOnFailureListener { error ->
+                statusView.text = "Event create failed: ${error.message ?: "network error"}"
+            }
+        }
+    }
+
+    private fun showEventStartPicker() {
+        hideKeyboard(eventTimeInput)
+        val dateBase = Calendar.getInstance().apply {
+            if (selectedEventStartAtMs > 0L) {
+                timeInMillis = selectedEventStartAtMs
+            } else {
+                add(Calendar.HOUR_OF_DAY, 1)
+            }
+        }
+        val dialog = DatePickerDialog(
+            this,
+            { _, year, month, dayOfMonth ->
+                val timeBase = Calendar.getInstance().apply {
+                    if (selectedEventStartAtMs > 0L) {
+                        timeInMillis = selectedEventStartAtMs
+                    } else {
+                        add(Calendar.HOUR_OF_DAY, 1)
+                    }
+                }
+                TimePickerDialog(
+                    this,
+                    { _, hourOfDay, minute ->
+                        val selected = Calendar.getInstance().apply {
+                            set(Calendar.YEAR, year)
+                            set(Calendar.MONTH, month)
+                            set(Calendar.DAY_OF_MONTH, dayOfMonth)
+                            set(Calendar.HOUR_OF_DAY, hourOfDay)
+                            set(Calendar.MINUTE, minute)
+                            set(Calendar.SECOND, 0)
+                            set(Calendar.MILLISECOND, 0)
+                        }
+                        selectedEventStartAtMs = selected.timeInMillis
+                        eventTimeInput.setText(formatEventStartTime(selectedEventStartAtMs))
+                        eventTimeInput.error = null
+                    },
+                    timeBase.get(Calendar.HOUR_OF_DAY),
+                    timeBase.get(Calendar.MINUTE),
+                    false
+                ).show()
+            },
+            dateBase.get(Calendar.YEAR),
+            dateBase.get(Calendar.MONTH),
+            dateBase.get(Calendar.DAY_OF_MONTH)
+        )
+        dialog.datePicker.minDate = System.currentTimeMillis() - 1000L
+        dialog.show()
+    }
+
+    private fun showEventLocationPicker() {
+        hideKeyboard(eventLocationInput)
+        showEventLocationMapDialog()
+    }
+
+    private fun showEventLocationMapDialog() {
+        Configuration.getInstance().userAgentValue = packageName
+        val initialPoint = selectedEventMapPoint()
+        var selectedPoint = initialPoint
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(8), dp(4), dp(8), 0)
+        }
+
+        val selectedLabel = TextView(this).apply {
+            text = "Tap the map to move event location"
+            textSize = 13f
+            setTextColor(Color.rgb(31, 41, 55))
+            setPadding(0, 0, 0, dp(8))
+        }
+        container.addView(selectedLabel, matchWrapNoMargin())
+
+        val pickerMap = OsmMapView(this).apply {
+            setTileSource(TileSourceFactory.MAPNIK)
+            setMultiTouchControls(true)
+            minZoomLevel = 3.0
+            maxZoomLevel = 20.0
+            controller.setZoom(if (hasEventOrUserLocation()) 16.0 else 5.0)
+            controller.setCenter(initialPoint)
+        }
+        val marker = Marker(pickerMap).apply {
+            title = "Event location"
+            position = initialPoint
+            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+        }
+        pickerMap.overlays.add(marker)
+        val updateSelection = { point: GeoPoint ->
+            selectedPoint = point
+            marker.position = point
+            selectedLabel.text = eventMapLocationLabel(point)
+            pickerMap.invalidate()
+        }
+        pickerMap.overlays.add(
+            MapEventsOverlay(object : MapEventsReceiver {
+                override fun singleTapConfirmedHelper(point: GeoPoint?): Boolean {
+                    point?.let { updateSelection(it) }
+                    return true
+                }
+
+                override fun longPressHelper(point: GeoPoint?): Boolean {
+                    point?.let { updateSelection(it) }
+                    return true
+                }
+            })
+        )
+        selectedLabel.text = eventMapLocationLabel(initialPoint)
+
+        container.addView(
+            pickerMap,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(360)).apply {
+                topMargin = dp(4)
+            }
+        )
+        container.addView(smallCommand("USE MY CURRENT LOCATION", GREEN).apply {
+            setOnClickListener {
+                val location = currentState.ownLocation ?: previewSnapshot
+                if (location == null) {
+                    requestPreviewLocationIfNeeded()
+                    statusView.text = "Waiting for your location."
+                } else {
+                    val point = GeoPoint(location.latitude, location.longitude)
+                    pickerMap.controller.animateTo(point)
+                    updateSelection(point)
+                }
+            }
+        }, matchWrap(top = 10))
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Select event location")
+            .setView(container)
+            .setPositiveButton("Use selected", null)
+            .setNeutralButton("Search", null)
+            .setNegativeButton("Cancel", null)
+            .create()
+
+        dialog.setOnShowListener {
+            pickerMap.onResume()
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                chooseEventMapPoint(selectedPoint)
+                pickerMap.onPause()
+                pickerMap.onDetach()
+                dialog.dismiss()
+            }
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                pickerMap.onPause()
+                pickerMap.onDetach()
+                dialog.dismiss()
+                showEventLocationSearchDialog()
+            }
+        }
+        dialog.setOnDismissListener {
+            runCatching { pickerMap.onPause() }
+            runCatching { pickerMap.onDetach() }
+        }
+        dialog.show()
+    }
+
+    private fun selectedEventMapPoint(): GeoPoint {
+        val selectedLat = selectedEventLatE7
+        val selectedLon = selectedEventLonE7
+        if (selectedLat != null && selectedLon != null) {
+            return GeoPoint(selectedLat / 10_000_000.0, selectedLon / 10_000_000.0)
+        }
+        currentState.ownLocation?.let { return GeoPoint(it.latitude, it.longitude) }
+        previewSnapshot?.let { return GeoPoint(it.latitude, it.longitude) }
+        requestPreviewLocationIfNeeded()
+        return GeoPoint(DEFAULT_MAP_PICKER_LATITUDE, DEFAULT_MAP_PICKER_LONGITUDE)
+    }
+
+    private fun hasEventOrUserLocation(): Boolean {
+        return (selectedEventLatE7 != null && selectedEventLonE7 != null) ||
+            currentState.ownLocation != null ||
+            previewSnapshot != null
+    }
+
+    private fun eventMapLocationLabel(point: GeoPoint): String {
+        return String.format(Locale.US, "Selected %.5f, %.5f", point.latitude, point.longitude)
+    }
+
+    private fun chooseEventMapPoint(point: GeoPoint) {
+        selectedEventLocationName = eventMapLocationLabel(point)
+        selectedEventLatE7 = (point.latitude * 10_000_000).roundToInt()
+        selectedEventLonE7 = (point.longitude * 10_000_000).roundToInt()
+        eventLocationInput.setText(selectedEventLocationName)
+        eventLocationInput.error = null
+        statusView.text = "Event location marked on map."
+    }
+
+    private fun showEventLocationSearchDialog() {
+        val searchInput = EditText(this).apply {
+            hint = "Search place or area"
+            setSingleLine(true)
+            inputType = InputType.TYPE_CLASS_TEXT
+            setPadding(dp(14), 0, dp(14), 0)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Search location")
+            .setView(searchInput)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Search") { _, _ ->
+                val query = searchInput.text.toString().trim()
+                if (query.isBlank()) {
+                    statusView.text = "Enter location to search."
+                } else {
+                    searchEventLocation(query)
+                }
+            }
+            .show()
+    }
+
+    private fun searchEventLocation(query: String) {
+        val requestId = ++eventLocationRequestId
+        val origin = currentState.ownLocation ?: previewSnapshot
+        statusView.text = "Searching event location..."
+        mapNavigationExecutor.execute {
+            runCatching { mapNavigationClient.search(query, origin?.latitude, origin?.longitude) }
+                .onSuccess { results ->
+                    runOnUiThread {
+                        if (requestId != eventLocationRequestId) return@runOnUiThread
+                        val ranked = if (origin == null) {
+                            results
+                        } else {
+                            results.sortedBy { result ->
+                                approximateDistanceMeters(origin.latitude, origin.longitude, result.latitude, result.longitude)
+                            }
+                        }
+                        if (ranked.isEmpty()) {
+                            statusView.text = "No location found. Try area or city name."
+                        } else if (ranked.size == 1) {
+                            chooseEventLocation(ranked.first())
+                        } else {
+                            showEventLocationResults(ranked)
+                        }
+                    }
+                }
+                .onFailure {
+                    runOnUiThread {
+                        if (requestId != eventLocationRequestId) return@runOnUiThread
+                        statusView.text = "Location search failed. Check internet and try again."
+                    }
+                }
+        }
+    }
+
+    private fun showEventLocationResults(results: List<PlaceSearchResult>) {
+        val labels = results.map { result ->
+            val area = result.address
+                .split(",")
+                .map { it.trim() }
+                .filter { it.isNotBlank() && it != result.name }
+                .take(3)
+                .joinToString(", ")
+            if (area.isBlank()) result.label else "${result.label}\n$area"
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Choose event location")
+            .setItems(labels) { _, which -> chooseEventLocation(results[which]) }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun chooseEventLocation(result: PlaceSearchResult) {
+        selectedEventLocationName = result.label
+        selectedEventLatE7 = (result.latitude * 10_000_000).toInt()
+        selectedEventLonE7 = (result.longitude * 10_000_000).toInt()
+        eventLocationInput.setText(selectedEventLocationName)
+        eventLocationInput.error = null
+        statusView.text = "Event location added."
+    }
+
+    private fun resetEventCreateForm() {
+        selectedEventStartAtMs = 0L
+        selectedEventLocationName = ""
+        selectedEventLatE7 = null
+        selectedEventLonE7 = null
+    }
+
+    private fun formatEventStartTime(timestampMs: Long): String {
+        return SimpleDateFormat("dd MMM yyyy, h:mm a", Locale.US).format(java.util.Date(timestampMs))
+    }
+
+    private fun openEventDetailsFromMap(event: BikeEvent) {
+        switchTab("events")
+        if (::eventsPage.isInitialized) {
+            eventsPage.post {
+                if (::eventsScroll.isInitialized) eventsScroll.smoothScrollTo(0, 0)
+                showEventDetailsDialog(event)
+            }
+        } else {
+            showEventDetailsDialog(event)
+        }
+    }
+
+    private fun showEventDetailsDialog(event: BikeEvent) {
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(4), 0, dp(4), 0)
+        }
+
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = gradientRounded(eventGradientStart(event.id), eventGradientEnd(event.id), dp(18), stroke = Color.argb(130, 255, 255, 255))
+        }
+        header.addView(TextView(this).apply {
+            text = event.name
+            textSize = 22f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            setLineSpacing(dp(2).toFloat(), 1.0f)
+        }, matchWrapNoMargin())
+        header.addView(TextView(this).apply {
+            text = event.eventTime.ifBlank { "Time not set" }
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.rgb(254, 243, 199))
+            setPadding(0, dp(8), 0, 0)
+        }, matchWrapNoMargin())
+        content.addView(header, matchWrapNoMargin())
+
+        content.addView(dialogDetailRow("Location", event.locationName.ifBlank { eventMapLocationLabel(GeoPoint(event.latitude, event.longitude)) }), matchWrap(top = 12))
+        content.addView(dialogDetailRow("Organizer", event.creatorName.ifBlank { "CoRider rider" }), matchWrap(top = 10))
+        content.addView(dialogDetailRow("Description", event.description.ifBlank { "No description added." }), matchWrap(top = 10))
+
+        val builder = AlertDialog.Builder(this)
+            .setTitle("Event details")
+            .setView(content)
+            .setPositiveButton("Close", null)
+        if (canDeleteEvent(event)) {
+            builder.setNegativeButton("Delete", null)
+        }
+
+        val dialog = builder.create()
+        dialog.setOnShowListener {
+            val deleteButton = dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
+            if (deleteButton != null) {
+                deleteButton.setTextColor(RED)
+                deleteButton.setOnClickListener {
+                    confirmDeleteEvent(event, dialog)
+                }
+            }
+        }
+        dialog.show()
+    }
+
+    private fun canDeleteEvent(event: BikeEvent): Boolean {
+        val user = FirebaseAuth.getInstance().currentUser
+        val email = user?.email.orEmpty().trim().lowercase(Locale.US)
+        val uid = currentGoogleUid().orEmpty()
+        if (uid.isBlank() && email != EVENT_ADMIN_EMAIL) return false
+        return email == EVENT_ADMIN_EMAIL ||
+            (event.creatorEmail.isNotBlank() && event.creatorEmail.equals(email, ignoreCase = true)) ||
+            (event.creatorId.isNotBlank() && event.creatorId == uid)
+    }
+
+    private fun confirmDeleteEvent(event: BikeEvent, eventDialog: AlertDialog) {
+        AlertDialog.Builder(this)
+            .setTitle("Delete event?")
+            .setMessage("This will remove ${event.name} from Events and map pins for everyone.")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Delete") { _, _ ->
+                eventDialog.dismiss()
+                deleteGlobalEvent(event)
+            }
+            .show()
+    }
+
+    private fun deleteGlobalEvent(event: BikeEvent) {
+        withFirebaseAuth {
+            if (!canDeleteEvent(event)) {
+                statusView.text = "Only the event creator or event admin can delete this event."
+                return@withFirebaseAuth
+            }
+            globalEventsRef().child(event.id).removeValue()
+                .addOnSuccessListener {
+                    globalBikeEvents.remove(event.id)
+                    renderEventsPage()
+                    if (::mapView.isInitialized) {
+                        mapView.setGlobalEvents(globalBikeEvents.values, show = !rideActive)
+                    }
+                    statusView.text = "Event deleted."
+                }
+                .addOnFailureListener { error ->
+                    statusView.text = "Delete failed: ${error.message ?: "network error"}"
+                }
+        }
+    }
+
+    private fun dialogDetailRow(label: String, value: String): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = rounded(Color.rgb(248, 250, 252), dp(12), stroke = Color.rgb(203, 213, 225))
+            addView(TextView(this@MainActivity).apply {
+                text = label
+                textSize = 11f
+                typeface = Typeface.DEFAULT_BOLD
+                letterSpacing = 0.04f
+                setTextColor(Color.rgb(100, 116, 139))
+            }, matchWrapNoMargin())
+            addView(TextView(this@MainActivity).apply {
+                text = value
+                textSize = 14f
+                setTextColor(Color.rgb(15, 23, 42))
+                setPadding(0, dp(4), 0, 0)
+                setLineSpacing(dp(2).toFloat(), 1.0f)
+            }, matchWrapNoMargin())
+        }
+    }
+
+    private fun startGlobalEventsListener() {
+        if (globalEventsListener != null) return
+        withFirebaseAuth {
+            val listener = object : ValueEventListener {
+                override fun onDataChange(snapshot: DataSnapshot) {
+                    applyGlobalEventsSnapshot(snapshot)
+                }
+
+                override fun onCancelled(error: DatabaseError) {
+                    statusView.text = "Events sync failed: ${error.message}"
+                }
+            }
+            globalEventsListener = listener
+            globalEventsRef().addValueEventListener(listener)
+        }
+    }
+
+    private fun stopGlobalEventsListener() {
+        globalEventsListener?.let { globalEventsRef().removeEventListener(it) }
+        globalEventsListener = null
+    }
+
+    private fun applyGlobalEventsSnapshot(snapshot: DataSnapshot) {
+        globalBikeEvents.clear()
+        snapshot.children.mapNotNull { readBikeEvent(it) }
+            .sortedByDescending { it.createdAtMs }
+            .forEach { globalBikeEvents[it.id] = it }
+        renderEventsPage()
+        if (::mapView.isInitialized) {
+            mapView.setGlobalEvents(globalBikeEvents.values, show = !rideActive)
+        }
+    }
+
+    private fun readBikeEvent(snapshot: DataSnapshot): BikeEvent? {
+        val id = snapshot.child("id").getValue(String::class.java) ?: snapshot.key ?: return null
+        val name = snapshot.child("name").getValue(String::class.java)?.trim().orEmpty()
+        val time = snapshot.child("eventTime").getValue(String::class.java)?.trim().orEmpty()
+        val createdAt = snapshot.child("createdAtMs").getValue(Long::class.java) ?: 0L
+        val startAt = snapshot.child("startAtMs").getValue(Long::class.java) ?: createdAt
+        val eventTime = time.ifBlank { if (startAt > 0L) formatEventStartTime(startAt) else "" }
+        val locationName = snapshot.child("locationName").getValue(String::class.java)?.trim().orEmpty()
+        val description = snapshot.child("description").getValue(String::class.java)?.trim().orEmpty()
+        val lat = snapshot.child("latE7").getValue(Int::class.java) ?: return null
+        val lon = snapshot.child("lonE7").getValue(Int::class.java) ?: return null
+        val creatorName = snapshot.child("creatorName").getValue(String::class.java).orEmpty()
+        val creatorId = snapshot.child("creatorUid").getValue(String::class.java)
+            ?: snapshot.child("creatorId").getValue(String::class.java)
+            ?: snapshot.child("localRiderId").getValue(String::class.java)
+            ?: ""
+        val creatorEmail = snapshot.child("creatorEmail").getValue(String::class.java).orEmpty().trim().lowercase(Locale.US)
+        if (name.isBlank()) return null
+        return BikeEvent(id, name, eventTime, startAt, locationName, description, lat, lon, creatorName, createdAt, creatorId, creatorEmail)
+    }
+
+    private fun globalEventsRef(): DatabaseReference {
+        return FirebaseDatabase.getInstance().getReference(GLOBAL_EVENTS_PATH)
+    }
+
+    private fun eventGradientStart(seed: String): Int {
+        return EVENT_GRADIENTS[(seed.hashCode() and Int.MAX_VALUE) % EVENT_GRADIENTS.size].first
+    }
+
+    private fun eventGradientEnd(seed: String): Int {
+        return EVENT_GRADIENTS[(seed.hashCode() and Int.MAX_VALUE) % EVENT_GRADIENTS.size].second
+    }
+
     private fun buildProfilePage(): ScrollView {
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -599,7 +1545,7 @@ class MainActivity : Activity(), RideBus.Listener {
             elevation = dp(5).toFloat()
         }
         val initialProfileName = prefs.getString(KEY_RIDER_NAME, "").orEmpty().ifBlank { "Rider" }
-        val profileTitle = TextView(this).apply {
+        profileTitleView = TextView(this).apply {
             text = initialProfileName
             textSize = 18f
             typeface = Typeface.DEFAULT_BOLD
@@ -607,7 +1553,7 @@ class MainActivity : Activity(), RideBus.Listener {
             gravity = Gravity.CENTER
             maxLines = 1
         }
-        val profileSubtitle = TextView(this).apply {
+        profileSubtitleView = TextView(this).apply {
             text = "Rider details"
             textSize = 12f
             setTextColor(Color.rgb(219, 234, 254))
@@ -627,12 +1573,40 @@ class MainActivity : Activity(), RideBus.Listener {
             setTextColor(Color.rgb(15, 23, 42))
         }, matchWrapNoMargin())
 
+        googleAuthStatusView = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.rgb(71, 85, 105))
+            setPadding(0, dp(8), 0, 0)
+            setLineSpacing(dp(2).toFloat(), 1.0f)
+        }
+        personalCard.addView(googleAuthStatusView, matchWrapNoMargin())
+
+        googleAuthButton = smallCommand("SIGN IN WITH GOOGLE", BLUE).apply {
+            setOnClickListener {
+                if (isGoogleSignedIn()) {
+                    signOutGoogle()
+                } else {
+                    signInWithGoogle()
+                }
+            }
+        }
+        personalCard.addView(googleAuthButton, matchWrap(top = 12))
+
         profileNameInput = profileInput("Full name", prefs.getString(KEY_RIDER_NAME, "").orEmpty()).apply {
             filters = arrayOf(lettersAndSpacesFilter(), InputFilter.LengthFilter(40))
         }
         profileContactInput = profileInput("Contact number", prefs.getString(KEY_CONTACT, "").orEmpty()).apply {
             inputType = InputType.TYPE_CLASS_PHONE
             filters = arrayOf(digitsOnlyFilter(), InputFilter.LengthFilter(10))
+        }
+        profileDobInput = profileInput("Date of birth", prefs.getString(KEY_DOB, "").orEmpty()).apply {
+            inputType = InputType.TYPE_NULL
+            keyListener = null
+            isFocusable = false
+            isCursorVisible = false
+            setOnClickListener {
+                if (profileEditMode) showDobPicker()
+            }
         }
         profileBloodInput = bloodGroupDropdown(prefs.getString(KEY_BLOOD_GROUP, "").orEmpty())
         profileBikeInput = profileInput("Bike / vehicle", prefs.getString(KEY_BIKE, "").orEmpty())
@@ -643,6 +1617,7 @@ class MainActivity : Activity(), RideBus.Listener {
 
         personalCard.addView(profileNameInput, matchWrap(top = 12))
         personalCard.addView(profileContactInput, matchWrap(top = 10))
+        personalCard.addView(profileDobInput, matchWrap(top = 10))
         personalCard.addView(profileBloodInput, matchWrap(top = 10))
         personalCard.addView(profileBikeInput, matchWrap(top = 10))
         personalCard.addView(profileEmergencyInput, matchWrap(top = 10))
@@ -656,15 +1631,16 @@ class MainActivity : Activity(), RideBus.Listener {
                     saveProfile()
                     hideKeyboard(this)
                     setProfileEditMode(false, this)
-                    profileTitle.text = profileName()
+                    profileTitleView.text = profileName()
                     statusView.text = "Details updated. Your map name is ${profileName()}."
                 }
             }
         }
         personalCard.addView(saveButton, matchWrap(top = 14))
         setProfileEditMode(false, saveButton)
-        profilePanel.addView(profileTitle, matchWrapNoMargin())
-        profilePanel.addView(profileSubtitle, matchWrapNoMargin())
+        updateGoogleAuthUi()
+        profilePanel.addView(profileTitleView, matchWrapNoMargin())
+        profilePanel.addView(profileSubtitleView, matchWrapNoMargin())
         profilePanel.addView(personalCard, matchWrapNoMargin())
         content.addView(profilePanel, matchWrapNoMargin())
 
@@ -965,6 +1941,7 @@ class MainActivity : Activity(), RideBus.Listener {
         panel.addView(nameInput, matchWrap(top = 12))
         val create = smallCommand("CREATE", BLUE).apply {
             setOnClickListener {
+                if (!requireGoogleIdentity("create groups")) return@setOnClickListener
                 val name = nameInput.text.toString().trim()
                 if (name.isBlank()) {
                     nameInput.error = "Group name is required"
@@ -974,6 +1951,7 @@ class MainActivity : Activity(), RideBus.Listener {
                 val code = nextGroupCode()
                 saveGroup(LocalGroup(code, name))
                 markGroupAdmin(code)
+                writeGroupMetadata(code, name)
                 renderGroupDetail(code)
             }
         }
@@ -1005,6 +1983,7 @@ class MainActivity : Activity(), RideBus.Listener {
         }
         val join = smallCommand("JOIN", BLUE).apply {
             setOnClickListener {
+                if (!requireGoogleIdentity("join groups")) return@setOnClickListener
                 val code = codeInput.text.toString().trim().uppercase(Locale.US)
                 if (code.isBlank()) {
                     statusView.text = "Enter a group code to join."
@@ -1323,10 +2302,16 @@ class MainActivity : Activity(), RideBus.Listener {
             inflateMenu(R.menu.bottom_nav)
             setBackgroundColor(TOP_BAR)
             elevation = dp(12).toFloat()
+            minimumHeight = dp(64)
+            itemIconSize = dp(25)
             itemIconTintList = navTint()
             itemTextColor = navTint()
-            itemRippleColor = ColorStateList.valueOf(Color.argb(45, 76, 141, 255))
-            labelVisibilityMode = com.google.android.material.navigation.NavigationBarView.LABEL_VISIBILITY_LABELED
+            itemRippleColor = ColorStateList.valueOf(Color.TRANSPARENT)
+            setItemActiveIndicatorEnabled(false)
+            labelVisibilityMode = com.google.android.material.navigation.NavigationBarView.LABEL_VISIBILITY_UNLABELED
+            for (index in 0 until menu.size()) {
+                menu.getItem(index).tooltipText = null
+            }
             setOnItemSelectedListener { item ->
                 if (updatingBottomNav) return@setOnItemSelectedListener true
                 when (item.itemId) {
@@ -1336,6 +2321,7 @@ class MainActivity : Activity(), RideBus.Listener {
                         renderGroupList()
                         switchTab("group")
                     }
+                    R.id.nav_events -> switchTab("events")
                     R.id.nav_profile -> switchTab("profile")
                 }
                 true
@@ -1355,6 +2341,7 @@ class MainActivity : Activity(), RideBus.Listener {
     }
 
     private fun startRide() {
+        if (!requireGoogleIdentity("start live tracking")) return
         val rideCode = rideCodeInput.text.toString().trim().uppercase(Locale.US)
         val riderName = profileName()
 
@@ -1370,8 +2357,7 @@ class MainActivity : Activity(), RideBus.Listener {
             .putString(KEY_RIDER_NAME, riderName)
             .apply()
 
-        FirebaseAuth.getInstance().signInAnonymously()
-            .addOnSuccessListener {
+        withFirebaseAuth {
                 if (isLocalAdminGroup(rideCode)) {
                     writeAdminRole(rideCode, riderId)
                 }
@@ -1387,12 +2373,10 @@ class MainActivity : Activity(), RideBus.Listener {
                 }
                 setupPanel.visibility = View.GONE
             }
-            .addOnFailureListener { error ->
-                statusView.text = "Firebase auth failed: ${error.message ?: "unknown"}"
-            }
     }
 
     private fun activateGroup(group: LocalGroup) {
+        if (!requireGoogleIdentity("activate groups")) return
         leaveWalkieIfDifferentGroup(group.code)
         if (isLocalAdminGroup(group.code)) {
             writeAdminRole(group.code, riderId)
@@ -1431,6 +2415,7 @@ class MainActivity : Activity(), RideBus.Listener {
     }
 
     private fun handleWalkieClick(groupCode: String) {
+        if (!requireGoogleIdentity("use walkie talkie")) return
         val voice = walkieTalkie.currentState()
         Log.i(TAG, "Walkie clicked group=$groupCode joined=${voice.joined} voiceGroup=${voice.groupCode} talking=${voice.talking}")
         if (!rideActive || currentState.rideId != groupCode) {
@@ -1441,6 +2426,13 @@ class MainActivity : Activity(), RideBus.Listener {
         }
         if (!voice.joined || voice.groupCode != groupCode) {
             requestWalkieTalkie(groupCode)
+            return
+        }
+        if (voice.onHold) {
+            statusView.text = "Walkie talkie is on hold during phone call."
+            if (::walkieStatusView.isInitialized) {
+                walkieStatusView.text = "Walkie talkie is on hold during phone call."
+            }
             return
         }
         walkieTalkie.setTalking(!voice.talking)
@@ -1497,11 +2489,13 @@ class MainActivity : Activity(), RideBus.Listener {
         walkieButton.text = when {
             !activeGroup -> "MAKE GROUP ACTIVE"
             !enoughRiders && !voice.joined -> "WAITING FOR RIDERS"
+            voice.onHold -> "ON HOLD"
             !voice.joined || voice.groupCode != selectedGroupCode -> "START WALKIE"
             voice.talking -> "STOP TALKING"
             else -> "TAP TO TALK"
         }
         walkieButton.background = when {
+            voice.onHold -> rounded(Color.rgb(71, 85, 105), dp(10), stroke = Color.rgb(148, 163, 184), strokeWidth = 2)
             voice.talking -> gradientRounded(Color.rgb(127, 29, 29), DANGER, dp(10), stroke = RED, strokeWidth = 2)
             voice.joined && voice.groupCode == selectedGroupCode -> gradientRounded(Color.rgb(7, 91, 50), GREEN, dp(10))
             activeGroup && !enoughRiders -> rounded(PILL, dp(10), stroke = CARD_STROKE)
@@ -1541,6 +2535,7 @@ class MainActivity : Activity(), RideBus.Listener {
         if (!activeGroup) return "Make this group ACTIVE to start rider voice communication."
         return when {
             voice.message.contains("AGORA_APP_ID") -> voice.message
+            voice.onHold -> "On hold during phone call. Walkie talkie will resume automatically when the call ends."
             !enoughRiders && !voice.joined -> "Waiting for at least 2 active riders before walkie talkie can start."
             voice.talking -> "Your microphone is live. Tap STOP TALKING when done."
             voice.joined -> "Listening to group voice. ${voice.speakerCount} rider(s) connected."
@@ -1587,6 +2582,7 @@ class MainActivity : Activity(), RideBus.Listener {
         val mapState = previewMapState(state)
         mapView.setState(mapState)
         updateMapOverlays(mapState)
+        routePendingDestinationIfPossible()
         updateGroupTab(state)
         highlightMode(state.updateMode)
     }
@@ -1609,6 +2605,11 @@ class MainActivity : Activity(), RideBus.Listener {
         livePill.visibility = if (state.active && state.rideId.isNotBlank()) View.VISIBLE else View.GONE
         livePill.text = "Live  ${state.rideId}"
         livePill.background = statusPill(state.active)
+        mapSearchPanel.visibility = View.VISIBLE
+        mapSearchPanel.bringToFront()
+        mapView.setGlobalEvents(globalBikeEvents.values, show = !state.active)
+        sosButton.visibility = if (state.active) View.VISIBLE else View.GONE
+        regroupButton.visibility = if (state.active) View.VISIBLE else View.GONE
         onlinePill.text = if (state.active) {
             "Online\n${riders.size} riders online"
         } else {
@@ -1692,6 +2693,192 @@ class MainActivity : Activity(), RideBus.Listener {
         val mapState = previewMapState(currentState)
         mapView.setState(mapState)
         updateMapOverlays(mapState)
+        routePendingDestinationIfPossible()
+    }
+
+    private fun searchMapDestination() {
+        val query = destinationSearchInput.text.toString().trim()
+        if (query.isBlank()) {
+            statusView.text = "Enter a destination."
+            return
+        }
+        hideKeyboard(destinationSearchInput)
+        destinationSearchInput.clearFocus()
+        showMapSearchMessage("Searching destination...")
+        clearRouteButton.visibility = View.VISIBLE
+
+        val requestId = ++mapNavigationRequestId
+        val origin = currentState.ownLocation ?: previewSnapshot
+        mapNavigationExecutor.execute {
+            runCatching { mapNavigationClient.search(query, origin?.latitude, origin?.longitude) }
+                .onSuccess { results ->
+                    runOnUiThread {
+                        if (requestId != mapNavigationRequestId) return@runOnUiThread
+                        val rankedResults = if (origin == null) {
+                            results
+                        } else {
+                            results.sortedBy { result ->
+                                approximateDistanceMeters(origin.latitude, origin.longitude, result.latitude, result.longitude)
+                            }
+                        }
+                        if (rankedResults.isEmpty()) {
+                            showMapSearchMessage("No destination found. Try adding area or city name.")
+                            return@runOnUiThread
+                        }
+                        if (rankedResults.size == 1) {
+                            chooseSearchResult(rankedResults.first())
+                        } else {
+                            showSearchResults(rankedResults)
+                        }
+                    }
+                }
+                .onFailure { error ->
+                    runOnUiThread {
+                        if (requestId != mapNavigationRequestId) return@runOnUiThread
+                        showMapSearchMessage("Search failed. Check internet and try again.")
+                    }
+                }
+        }
+    }
+
+    private fun showSearchResults(results: List<PlaceSearchResult>) {
+        val labels = results.map { result ->
+            val shortAddress = result.address
+                .split(",")
+                .map { it.trim() }
+                .filter { it.isNotBlank() && it != result.name }
+                .take(3)
+                .joinToString(", ")
+            if (shortAddress.isBlank()) result.label else "${result.label}\n$shortAddress"
+        }.toTypedArray()
+
+        AlertDialog.Builder(this)
+            .setTitle("Choose destination")
+            .setItems(labels) { _, which ->
+                chooseSearchResult(results[which])
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun chooseSearchResult(result: PlaceSearchResult) {
+        selectedDestination = result
+        pendingRouteDestination = result
+        destinationSearchInput.setText(result.label)
+        destinationSearchInput.setSelection(destinationSearchInput.text.length)
+        mapView.showDestination(result.label, result.latitude, result.longitude)
+        requestRouteToDestination(result)
+    }
+
+    private fun requestRouteToDestination(destination: PlaceSearchResult) {
+        val origin = currentState.ownLocation ?: previewSnapshot
+        if (origin == null) {
+            pendingRouteDestination = destination
+            routeInfoPill.text = "${destination.label}\nWaiting for your location"
+            routeInfoPill.visibility = View.VISIBLE
+            clearRouteButton.visibility = View.VISIBLE
+            showMapSearchMessage("${destination.label}\nWaiting for your location")
+            return
+        }
+
+        pendingRouteDestination = null
+        routeInProgress = true
+        routeInfoPill.text = "${destination.label}\nGetting directions..."
+        routeInfoPill.visibility = View.VISIBLE
+        clearRouteButton.visibility = View.VISIBLE
+        showMapSearchMessage("${destination.label}\nGetting directions...")
+
+        val requestId = ++mapNavigationRequestId
+        mapNavigationExecutor.execute {
+            runCatching {
+                mapNavigationClient.route(
+                    origin.latitude,
+                    origin.longitude,
+                    destination.latitude,
+                    destination.longitude
+                )
+            }.onSuccess { route ->
+                runOnUiThread {
+                    if (requestId != mapNavigationRequestId) return@runOnUiThread
+                    routeInProgress = false
+                    if (route == null) {
+                        statusView.text = "Directions unavailable for this destination."
+                        routeInfoPill.text = "${destination.label}\nRoute unavailable"
+                        return@runOnUiThread
+                    }
+                    showRoute(destination, route)
+                }
+            }.onFailure { error ->
+                runOnUiThread {
+                    if (requestId != mapNavigationRequestId) return@runOnUiThread
+                    routeInProgress = false
+                    statusView.text = "Directions failed: ${error.message ?: "network error"}"
+                    routeInfoPill.text = "${destination.label}\nDirections failed"
+                }
+            }
+        }
+    }
+
+    private fun routePendingDestinationIfPossible() {
+        val destination = pendingRouteDestination ?: return
+        if (routeInProgress) return
+        if ((currentState.ownLocation ?: previewSnapshot) == null) return
+        requestRouteToDestination(destination)
+    }
+
+    private fun showRoute(destination: PlaceSearchResult, route: RouteResult) {
+        mapView.showRoute(route.points)
+        routeInfoPill.text = "${destination.label}\n${formatRouteDistance(route.distanceMeters)} - ${formatRouteDuration(route.durationSeconds)}"
+        routeInfoPill.visibility = View.VISIBLE
+        clearRouteButton.visibility = View.VISIBLE
+        statusView.text = "Directions ready."
+    }
+
+    private fun showMapSearchMessage(message: String) {
+        routeInfoPill.text = message
+        routeInfoPill.visibility = View.VISIBLE
+    }
+
+    private fun clearMapDirections() {
+        selectedDestination = null
+        pendingRouteDestination = null
+        routeInProgress = false
+        mapNavigationRequestId++
+        destinationSearchInput.text?.clear()
+        routeInfoPill.visibility = View.GONE
+        clearRouteButton.visibility = View.GONE
+        mapView.clearNavigation()
+        statusView.text = locationStatus(currentState)
+    }
+
+    private fun formatRouteDistance(distanceMeters: Double): String {
+        return if (distanceMeters >= 1000.0) {
+            String.format(Locale.US, "%.1f km", distanceMeters / 1000.0)
+        } else {
+            "${distanceMeters.toInt().coerceAtLeast(0)} m"
+        }
+    }
+
+    private fun formatRouteDuration(durationSeconds: Double): String {
+        val minutes = ((durationSeconds + 30.0) / 60.0).toInt().coerceAtLeast(1)
+        return if (minutes >= 60) {
+            val hours = minutes / 60
+            val remaining = minutes % 60
+            if (remaining == 0) "${hours} hr" else "${hours} hr ${remaining} min"
+        } else {
+            "$minutes min"
+        }
+    }
+
+    private fun approximateDistanceMeters(
+        fromLatitude: Double,
+        fromLongitude: Double,
+        toLatitude: Double,
+        toLongitude: Double
+    ): Float {
+        val result = FloatArray(1)
+        Location.distanceBetween(fromLatitude, fromLongitude, toLatitude, toLongitude, result)
+        return result[0]
     }
 
     private fun openRiderOnMap(riderId: String?) {
@@ -1901,14 +3088,17 @@ class MainActivity : Activity(), RideBus.Listener {
         selectedTab = tab
         mapPage.visibility = if (tab == "map") View.VISIBLE else View.GONE
         groupPage.visibility = if (tab == "group") View.VISIBLE else View.GONE
+        eventsPage.visibility = if (tab == "events") View.VISIBLE else View.GONE
         profilePage.visibility = if (tab == "profile") View.VISIBLE else View.GONE
         topBar.visibility = if (tab == "map") View.GONE else View.VISIBLE
         pageTitle.text = when (tab) {
             "group" -> "Group"
+            "events" -> "Events"
             "profile" -> "Profile"
             else -> "Map"
         }
         updateTopBarBackButton()
+        if (tab == "events") renderEventsPage()
         if (tab == "profile") updateBatteryStatus()
         setupPanel.visibility = View.GONE
         styleBottomTabs()
@@ -1972,6 +3162,7 @@ class MainActivity : Activity(), RideBus.Listener {
         if (!::bottomNav.isInitialized) return
         val targetItemId = when (selectedTab) {
             "group" -> R.id.nav_group
+            "events" -> R.id.nav_events
             "profile" -> R.id.nav_profile
             else -> R.id.nav_map
         }
@@ -1986,6 +3177,7 @@ class MainActivity : Activity(), RideBus.Listener {
         prefs.edit()
             .putString(KEY_RIDER_NAME, profileNameInput.text.toString().trim())
             .putString(KEY_CONTACT, profileContactInput.text.toString().trim())
+            .putString(KEY_DOB, profileDobInput.text.toString().trim())
             .putString(KEY_BLOOD_GROUP, selectedBloodGroup())
             .putString(KEY_BIKE, profileBikeInput.text.toString().trim())
             .putString(KEY_EMERGENCY_CONTACT, profileEmergencyInput.text.toString().trim())
@@ -2005,6 +3197,14 @@ class MainActivity : Activity(), RideBus.Listener {
             field.setHintTextColor(Color.rgb(100, 116, 139))
             field.background = profileFieldBackground()
         }
+        profileDobInput.isEnabled = enabled
+        profileDobInput.isClickable = enabled
+        profileDobInput.isFocusable = false
+        profileDobInput.isCursorVisible = false
+        profileDobInput.alpha = 1f
+        profileDobInput.setTextColor(Color.rgb(15, 23, 42))
+        profileDobInput.setHintTextColor(Color.rgb(100, 116, 139))
+        profileDobInput.background = profileFieldBackground()
         profileBloodInput.isEnabled = enabled
         profileBloodInput.alpha = 1f
         profileBloodInput.background = profileFieldBackground()
@@ -2020,6 +3220,7 @@ class MainActivity : Activity(), RideBus.Listener {
 
         profileNameInput.error = null
         profileContactInput.error = null
+        profileDobInput.error = null
         profileEmergencyInput.error = null
         profileBloodInput.background = profileFieldBackground()
 
@@ -2155,6 +3356,25 @@ class MainActivity : Activity(), RideBus.Listener {
     }
 
     private fun deleteGroup(group: LocalGroup) {
+        if (!requireGoogleIdentity("delete groups")) return
+        if (isAdminForGroup(group.code) || isLocalAdminGroup(group.code)) {
+            FirebaseDatabase.getInstance()
+                .getReference("rides/${group.code}")
+                .removeValue()
+                .addOnSuccessListener {
+                    removeLocalGroup(group)
+                    statusView.text = "${groupListTitle(group)} deleted for everyone."
+                }
+                .addOnFailureListener { error ->
+                    statusView.text = "Group delete failed: ${error.message ?: "network error"}"
+                }
+            return
+        }
+        removeLocalGroup(group)
+        statusView.text = "${groupListTitle(group)} removed from this phone."
+    }
+
+    private fun removeLocalGroup(group: LocalGroup) {
         val remaining = loadGroups().filterNot { it.code == group.code }
         val editor = prefs.edit()
             .putStringSet(KEY_GROUPS, remaining.map { "${it.code}|${it.name}" }.toSet())
@@ -2288,6 +3508,60 @@ class MainActivity : Activity(), RideBus.Listener {
         }
     }
 
+    private fun currentRiderIdentityId(): String {
+        return currentGoogleUid() ?: getOrCreateRiderId()
+    }
+
+    private fun currentGoogleUid(): String? {
+        val user = FirebaseAuth.getInstance().currentUser ?: return null
+        return if (isGoogleSignedIn(user) && !user.isAnonymous) user.uid else null
+    }
+
+    private fun requireGoogleIdentity(action: String): Boolean {
+        if (currentGoogleUid() != null) return true
+        statusView.text = "Sign in with Google to $action."
+        if (selectedTab != "profile") switchTab("profile")
+        return false
+    }
+
+    private fun writeGroupMetadata(groupCode: String, groupName: String) {
+        val uid = currentGoogleUid() ?: return
+        val user = FirebaseAuth.getInstance().currentUser
+        FirebaseDatabase.getInstance()
+            .getReference("rides/$groupCode/meta")
+            .updateChildren(
+                mapOf(
+                    "code" to groupCode,
+                    "name" to groupName,
+                    "createdByUid" to uid,
+                    "createdByEmail" to user?.email.orEmpty().trim().lowercase(Locale.US),
+                    "createdByName" to profileName(),
+                    "createdAtMs" to System.currentTimeMillis()
+                )
+            )
+    }
+
+    private fun resetLegacyIdentityDataIfNeeded() {
+        if (prefs.getBoolean(KEY_GOOGLE_IDENTITY_RESET_DONE, false)) return
+        FirebaseAuth.getInstance().signOut()
+        prefs.edit()
+            .remove(KEY_RIDE_CODE)
+            .remove(KEY_RIDER_NAME)
+            .remove(KEY_RIDER_ID)
+            .remove(KEY_GROUPS)
+            .remove(KEY_ADMIN_GROUPS)
+            .remove(KEY_ACTIVE_GROUP_CODE)
+            .remove(KEY_CONTACT)
+            .remove(KEY_DOB)
+            .remove(KEY_BLOOD_GROUP)
+            .remove(KEY_BIKE)
+            .remove(KEY_EMERGENCY_CONTACT)
+            .remove(KEY_GOOGLE_EMAIL)
+            .remove(KEY_GOOGLE_UID)
+            .putBoolean(KEY_GOOGLE_IDENTITY_RESET_DONE, true)
+            .apply()
+    }
+
     private fun withFirebaseAuth(block: () -> Unit) {
         val auth = FirebaseAuth.getInstance()
         if (auth.currentUser != null) {
@@ -2299,6 +3573,186 @@ class MainActivity : Activity(), RideBus.Listener {
             .addOnFailureListener { error ->
                 statusView.text = "Firebase auth failed: ${error.message ?: "unknown"}"
             }
+    }
+
+    private fun signInWithGoogle() {
+        val clientId = googleWebClientId()
+        if (clientId.isBlank()) {
+            showGoogleSetupDialog()
+            return
+        }
+
+        googleAuthButton.isEnabled = false
+        googleAuthButton.text = "SIGNING IN..."
+        statusView.text = "Opening Google sign-in..."
+
+        val googleIdOption = GetGoogleIdOption.Builder()
+            .setFilterByAuthorizedAccounts(false)
+            .setServerClientId(clientId)
+            .setAutoSelectEnabled(false)
+            .build()
+        val request = GetCredentialRequest.Builder()
+            .addCredentialOption(googleIdOption)
+            .build()
+
+        credentialManager.getCredentialAsync(
+            this,
+            request,
+            CancellationSignal(),
+            mainThreadExecutor,
+            object : CredentialManagerCallback<GetCredentialResponse, GetCredentialException> {
+                override fun onResult(result: GetCredentialResponse) {
+                    handleGoogleCredentialResponse(result)
+                }
+
+                override fun onError(e: GetCredentialException) {
+                    googleAuthButton.isEnabled = true
+                    updateGoogleAuthUi()
+                    statusView.text = "Google sign-in cancelled or failed."
+                }
+            }
+        )
+    }
+
+    private fun handleGoogleCredentialResponse(result: GetCredentialResponse) {
+        val credential = result.credential
+        if (credential !is CustomCredential ||
+            credential.type != GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
+        ) {
+            googleAuthButton.isEnabled = true
+            updateGoogleAuthUi()
+            statusView.text = "Google sign-in returned an unsupported credential."
+            return
+        }
+
+        val googleCredential = runCatching {
+            GoogleIdTokenCredential.createFrom(credential.data)
+        }.getOrElse { error ->
+            googleAuthButton.isEnabled = true
+            updateGoogleAuthUi()
+            statusView.text = "Could not read Google account: ${error.message ?: "credential error"}"
+            return
+        }
+
+        val firebaseCredential = GoogleAuthProvider.getCredential(googleCredential.idToken, null)
+        FirebaseAuth.getInstance().signInWithCredential(firebaseCredential)
+            .addOnSuccessListener { authResult ->
+                applyGoogleUserToProfile(authResult.user)
+            }
+            .addOnFailureListener { error ->
+                statusView.text = "Google auth failed: ${error.message ?: "unknown"}"
+            }
+            .addOnCompleteListener {
+                googleAuthButton.isEnabled = true
+                updateGoogleAuthUi()
+            }
+    }
+
+    private fun applyGoogleUserToProfile(user: FirebaseUser?) {
+        if (user == null) return
+        val googleName = sanitizeGoogleName(user.displayName.orEmpty())
+        val googlePhone = normalizedPhoneNumber(user.phoneNumber.orEmpty())
+
+        if (googleName.isNotBlank()) {
+            profileNameInput.setText(googleName)
+            profileTitleView.text = googleName
+        }
+        if (googlePhone.isNotBlank()) {
+            profileContactInput.setText(googlePhone)
+        }
+
+        prefs.edit()
+            .putString(KEY_GOOGLE_EMAIL, user.email.orEmpty())
+            .putString(KEY_GOOGLE_UID, user.uid)
+            .apply()
+        saveProfile()
+
+        val missing = mutableListOf<String>()
+        if (googlePhone.isBlank()) missing.add("mobile number")
+        if (profileDobInput.text.toString().isBlank()) missing.add("DOB")
+        statusView.text = if (missing.isEmpty()) {
+            "Google connected. Profile updated."
+        } else {
+            "Google connected. ${missing.joinToString(" and ")} must be added manually."
+        }
+    }
+
+    private fun signOutGoogle() {
+        FirebaseAuth.getInstance().signOut()
+        prefs.edit()
+            .remove(KEY_GOOGLE_EMAIL)
+            .remove(KEY_GOOGLE_UID)
+            .apply()
+        updateGoogleAuthUi()
+        statusView.text = "Google signed out. Guest Firebase auth will continue."
+        withFirebaseAuth {}
+    }
+
+    private fun updateGoogleAuthUi() {
+        if (!::googleAuthButton.isInitialized || !::googleAuthStatusView.isInitialized) return
+        val user = FirebaseAuth.getInstance().currentUser
+        val signedIn = isGoogleSignedIn(user)
+        googleAuthButton.isEnabled = true
+        googleAuthButton.text = if (signedIn) "SIGN OUT GOOGLE" else "SIGN IN WITH GOOGLE"
+        googleAuthButton.background = rounded(if (signedIn) PILL else BLUE, dp(8), stroke = CARD_STROKE)
+        val email = user?.email?.takeIf { it.isNotBlank() } ?: prefs.getString(KEY_GOOGLE_EMAIL, "").orEmpty()
+        googleAuthStatusView.text = if (signedIn) {
+            "Google connected: $email"
+        } else {
+            "Sign in with Google to fill your name. Mobile number and DOB may still need manual entry."
+        }
+        if (::profileSubtitleView.isInitialized) {
+            profileSubtitleView.text = if (signedIn && email.isNotBlank()) email else "Rider details"
+        }
+    }
+
+    private fun isGoogleSignedIn(user: FirebaseUser? = FirebaseAuth.getInstance().currentUser): Boolean {
+        return user?.providerData?.any { it.providerId == GoogleAuthProvider.PROVIDER_ID } == true
+    }
+
+    private fun googleWebClientId(): String {
+        val configured = BuildConfig.GOOGLE_WEB_CLIENT_ID.trim().trim('"')
+        if (configured.isNotBlank()) return configured
+        val resourceId = resources.getIdentifier("default_web_client_id", "string", packageName)
+        return if (resourceId != 0) getString(resourceId).trim() else ""
+    }
+
+    private fun showGoogleSetupDialog() {
+        AlertDialog.Builder(this)
+            .setTitle("Google sign-in setup needed")
+            .setMessage("Add GOOGLE_WEB_CLIENT_ID to local.properties, or update app/google-services.json after enabling Google sign-in in Firebase. Then rebuild the APK.")
+            .setPositiveButton("OK", null)
+            .show()
+    }
+
+    private fun sanitizeGoogleName(name: String): String {
+        return name
+            .filter { it.isLetter() || it == ' ' }
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .take(40)
+    }
+
+    private fun normalizedPhoneNumber(phone: String): String {
+        val digits = phone.filter { it.isDigit() }
+        return if (digits.length >= 10) digits.takeLast(10) else ""
+    }
+
+    private fun showDobPicker() {
+        val calendar = Calendar.getInstance()
+        calendar.add(Calendar.YEAR, -18)
+        val dialog = DatePickerDialog(
+            this,
+            { _, year, month, day ->
+                calendar.set(year, month, day, 0, 0, 0)
+                profileDobInput.setText(SimpleDateFormat("dd MMM yyyy", Locale.US).format(calendar.time))
+            },
+            calendar.get(Calendar.YEAR),
+            calendar.get(Calendar.MONTH),
+            calendar.get(Calendar.DAY_OF_MONTH)
+        )
+        dialog.datePicker.maxDate = System.currentTimeMillis()
+        dialog.show()
     }
 
     private fun riderListText(groupCode: String): String {
@@ -2432,7 +3886,7 @@ class MainActivity : Activity(), RideBus.Listener {
                 view.paddingLeft,
                 insets.systemWindowInsetTop,
                 view.paddingRight,
-                insets.systemWindowInsetBottom
+                0
             )
             insets
         }
@@ -2986,12 +4440,20 @@ class MainActivity : Activity(), RideBus.Listener {
         private const val KEY_ADMIN_GROUPS = "admin_groups"
         private const val KEY_ACTIVE_GROUP_CODE = "active_group_code"
         private const val KEY_CONTACT = "contact"
+        private const val KEY_DOB = "dob"
         private const val KEY_BLOOD_GROUP = "blood_group"
         private const val KEY_BIKE = "bike"
         private const val KEY_EMERGENCY_CONTACT = "emergency_contact"
+        private const val KEY_GOOGLE_EMAIL = "google_email"
+        private const val KEY_GOOGLE_UID = "google_uid"
+        private const val KEY_GOOGLE_IDENTITY_RESET_DONE = "google_identity_reset_done_v1"
         private const val INVITE_HOST = "rahulsanapala.github.io"
         private const val INVITE_PATH = "/corider-tracker/join.html"
         private const val ADMIN_ROLE_REFRESH_MS = 60_000L
+        private const val GLOBAL_EVENTS_PATH = "globalBikeEvents"
+        private const val EVENT_ADMIN_EMAIL = "sanapala.rahul02@gmail.com"
+        private const val DEFAULT_MAP_PICKER_LATITUDE = 20.5937
+        private const val DEFAULT_MAP_PICKER_LONGITUDE = 78.9629
 
         private val SURFACE = Color.rgb(7, 9, 13)
         private val TOP_BAR = Color.rgb(5, 7, 12)
@@ -3006,6 +4468,13 @@ class MainActivity : Activity(), RideBus.Listener {
         private val RED = Color.rgb(248, 91, 91)
         private val DANGER = Color.rgb(126, 38, 50)
         private val AMBER = Color.rgb(245, 173, 66)
+        private val EVENT_GRADIENTS = arrayOf(
+            Color.rgb(249, 115, 22) to Color.rgb(88, 28, 135),
+            Color.rgb(14, 165, 233) to Color.rgb(126, 34, 206),
+            Color.rgb(16, 185, 129) to Color.rgb(20, 83, 45),
+            Color.rgb(236, 72, 153) to Color.rgb(79, 70, 229),
+            Color.rgb(245, 158, 11) to Color.rgb(153, 27, 27)
+        )
     }
 }
 

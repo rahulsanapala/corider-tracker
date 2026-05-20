@@ -58,6 +58,7 @@ class LiveLocationService : Service(), LocationListener {
     private var lastNotifiedSafetyCheckId = ""
     private var lastServiceSosToneTimestampMs = 0L
     private var groupEventsStartedAtMs = 0L
+    private var currentUpdateMode = UpdateMode.NORMAL
     private var sosTone: ToneGenerator? = null
     private val handler = Handler(Looper.getMainLooper())
     private val heartbeatRunnable = object : Runnable {
@@ -161,6 +162,7 @@ class LiveLocationService : Service(), LocationListener {
         lastNotifiedSafetyCheckId = ""
         lastServiceSosToneTimestampMs = 0L
         groupEventsStartedAtMs = System.currentTimeMillis()
+        applyUpdateMode(UpdateMode.NORMAL, refreshLocationRequests = false)
 
         startForeground(NOTIFICATION_ID, buildNotification())
         RideBus.setRide(rideId, riderId, riderName)
@@ -190,11 +192,12 @@ class LiveLocationService : Service(), LocationListener {
             return
         }
 
+        val sampling = samplingFor(currentUpdateMode)
         providers.forEach { provider ->
-            locationManager.requestLocationUpdates(provider, SAMPLE_INTERVAL_MS, SAMPLE_DISTANCE_M, this)
+            locationManager.requestLocationUpdates(provider, sampling.intervalMs, sampling.distanceM, this)
             locationManager.getLastKnownLocation(provider)?.let { onLocationChanged(it) }
         }
-        RideBus.setStatus("Listening for GPS and Firebase updates")
+        RideBus.setStatus("Listening for GPS in ${currentUpdateMode.name.lowercase()} mode")
     }
 
     private fun refreshTracking() {
@@ -378,8 +381,6 @@ class LiveLocationService : Service(), LocationListener {
         private const val NOTIFICATION_ID = 701
         private const val SAFETY_NOTIFICATION_ID = 702
         private const val SOS_NOTIFICATION_ID = 703
-        private const val SAMPLE_INTERVAL_MS = 3_000L
-        private const val SAMPLE_DISTANCE_M = 5f
         private const val HEARTBEAT_INTERVAL_MS = 60_000L
         private const val STATIONARY_SPEED_MPS = 0.8
         private const val STATIONARY_REQUIRED_MS = 10 * 60 * 1000L
@@ -432,8 +433,7 @@ class LiveLocationService : Service(), LocationListener {
             override fun onDataChange(snapshot: DataSnapshot) {
                 val value = snapshot.getValue(String::class.java) ?: "NORMAL"
                 val mode = runCatching { UpdateMode.valueOf(value) }.getOrDefault(UpdateMode.NORMAL)
-                gate.setMode(mode)
-                RideBus.setUpdateMode(mode)
+                applyUpdateMode(mode)
             }
             override fun onCancelled(error: DatabaseError) = Unit
         }
@@ -852,10 +852,32 @@ class LiveLocationService : Service(), LocationListener {
 
     private fun setMode(modeText: String) {
         val mode = runCatching { UpdateMode.valueOf(modeText) }.getOrDefault(UpdateMode.NORMAL)
-        gate.setMode(mode)
+        applyUpdateMode(mode)
         FirebaseDatabase.getInstance().getReference(rideRootPath).child("settings").child("mode").setValue(mode.name)
-        RideBus.setUpdateMode(mode)
     }
+
+    private fun applyUpdateMode(mode: UpdateMode, refreshLocationRequests: Boolean = true) {
+        val changed = currentUpdateMode != mode
+        currentUpdateMode = mode
+        gate.setMode(mode)
+        RideBus.setUpdateMode(mode)
+        if (running && refreshLocationRequests && changed) {
+            requestLocationUpdates()
+        }
+    }
+
+    private fun samplingFor(mode: UpdateMode): LocationSampling {
+        return when (mode) {
+            UpdateMode.ECO -> LocationSampling(15_000L, 20f)
+            UpdateMode.NORMAL -> LocationSampling(8_000L, 10f)
+            UpdateMode.FAST -> LocationSampling(3_000L, 5f)
+        }
+    }
+
+    private data class LocationSampling(
+        val intervalMs: Long,
+        val distanceM: Float
+    )
 
     private fun readRiderSnapshot(snapshot: DataSnapshot): RiderSnapshot? {
         val id = snapshot.child("id").getValue(String::class.java) ?: snapshot.key ?: return null
@@ -869,4 +891,5 @@ class LiveLocationService : Service(), LocationListener {
         val stationarySince = snapshot.child("stationarySinceMs").getValue(Long::class.java) ?: 0L
         return RiderSnapshot(id, name, latE7, lonE7, speed, bearing, accuracy, updatedAt, stationarySince)
     }
+
 }

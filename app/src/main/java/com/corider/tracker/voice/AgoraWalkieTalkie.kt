@@ -1,6 +1,9 @@
 package com.corider.tracker.voice
 
 import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.util.Log
 import com.corider.tracker.BuildConfig
 import io.agora.rtc2.ChannelMediaOptions
@@ -13,6 +16,7 @@ class AgoraWalkieTalkie(private val context: Context) {
         val groupCode: String = "",
         val joined: Boolean = false,
         val talking: Boolean = false,
+        val onHold: Boolean = false,
         val speakerCount: Int = 0,
         val message: String = "Walkie talkie ready"
     )
@@ -20,17 +24,32 @@ class AgoraWalkieTalkie(private val context: Context) {
     var onStateChanged: ((State) -> Unit)? = null
 
     private val remoteSpeakers = linkedSetOf<Int>()
+    private val audioManager = context.getSystemService(AudioManager::class.java)
     private var engine: RtcEngine? = null
     private var groupCode = ""
     private var channelName = ""
     private var joined = false
     private var talking = false
+    private var onHold = false
+    private var talkingBeforeHold = false
     private var message = "Walkie talkie ready"
+    private var audioFocusRequest: AudioFocusRequest? = null
+
+    private val audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_LOSS,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> enterCallHold()
+            AudioManager.AUDIOFOCUS_GAIN -> exitCallHold()
+        }
+    }
 
     private val handler = object : IRtcEngineEventHandler() {
         override fun onJoinChannelSuccess(channel: String?, uid: Int, elapsed: Int) {
             joined = true
             talking = false
+            onHold = false
+            talkingBeforeHold = false
             message = "Voice connected"
             Log.i(TAG, "Joined voice channel=${channel.orEmpty()} uid=$uid")
             publishState()
@@ -82,6 +101,11 @@ class AgoraWalkieTalkie(private val context: Context) {
         channelName = nextChannel
         Log.i(TAG, "Joining voice group=$groupCode channel=$channelName")
         return runCatching {
+            if (!requestAudioFocus()) {
+                this.groupCode = ""
+                channelName = ""
+                return@runCatching false
+            }
             val rtcEngine = engine ?: createEngine().also { engine = it }
             rtcEngine.enableAudio()
             rtcEngine.setChannelProfile(Constants.CHANNEL_PROFILE_COMMUNICATION)
@@ -91,6 +115,7 @@ class AgoraWalkieTalkie(private val context: Context) {
             )
             rtcEngine.setDefaultAudioRoutetoSpeakerphone(true)
             rtcEngine.muteLocalAudioStream(true)
+            rtcEngine.muteAllRemoteAudioStreams(false)
 
             val options = ChannelMediaOptions().apply {
                 channelProfile = Constants.CHANNEL_PROFILE_COMMUNICATION
@@ -121,15 +146,14 @@ class AgoraWalkieTalkie(private val context: Context) {
             publishState()
             return
         }
+        if (onHold) {
+            message = "Walkie talkie on hold during phone call"
+            publishState()
+            return
+        }
         runCatching {
             talking = enabled
-            engine?.muteLocalAudioStream(!enabled)
-            engine?.updateChannelMediaOptions(ChannelMediaOptions().apply {
-                channelProfile = Constants.CHANNEL_PROFILE_COMMUNICATION
-                clientRoleType = Constants.CLIENT_ROLE_BROADCASTER
-                publishMicrophoneTrack = enabled
-                autoSubscribeAudio = true
-            })
+            applyAudioState(enabled)
             message = if (enabled) "Talking to group" else "Listening to group"
             Log.i(TAG, message)
         }.onFailure { error ->
@@ -144,11 +168,15 @@ class AgoraWalkieTalkie(private val context: Context) {
         if (!joined && channelName.isBlank()) return
         talking = false
         joined = false
+        onHold = false
+        talkingBeforeHold = false
         remoteSpeakers.clear()
         runCatching {
             engine?.muteLocalAudioStream(true)
+            engine?.muteAllRemoteAudioStreams(true)
             engine?.leaveChannel()
         }
+        abandonAudioFocus()
         groupCode = ""
         channelName = ""
         message = "Walkie talkie ready"
@@ -164,10 +192,88 @@ class AgoraWalkieTalkie(private val context: Context) {
         }
     }
 
-    fun currentState(): State = State(groupCode, joined, talking, remoteSpeakers.size, message)
+    fun currentState(): State = State(groupCode, joined, talking, onHold, remoteSpeakers.size, message)
 
     private fun createEngine(): RtcEngine {
         return RtcEngine.create(context.applicationContext, BuildConfig.AGORA_APP_ID, handler)
+    }
+
+    private fun requestAudioFocus(): Boolean {
+        val request = audioFocusRequest ?: AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            .setOnAudioFocusChangeListener(audioFocusChangeListener)
+            .setWillPauseWhenDucked(true)
+            .build()
+            .also { audioFocusRequest = it }
+        val result = audioManager.requestAudioFocus(request)
+        if (result != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            message = "Phone audio is busy. Walkie will retry when audio is free."
+            publishState()
+            Log.w(TAG, "Audio focus request failed result=$result")
+        }
+        return result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+    }
+
+    private fun abandonAudioFocus() {
+        audioFocusRequest?.let { request ->
+            runCatching { audioManager.abandonAudioFocusRequest(request) }
+        }
+    }
+
+    private fun enterCallHold() {
+        if (!joined || onHold) return
+        talkingBeforeHold = talking
+        talking = false
+        onHold = true
+        runCatching {
+            engine?.muteLocalAudioStream(true)
+            engine?.muteAllRemoteAudioStreams(true)
+            engine?.updateChannelMediaOptions(ChannelMediaOptions().apply {
+                channelProfile = Constants.CHANNEL_PROFILE_COMMUNICATION
+                clientRoleType = Constants.CLIENT_ROLE_BROADCASTER
+                publishMicrophoneTrack = false
+                autoSubscribeAudio = false
+            })
+        }
+        message = "Walkie talkie on hold during phone call"
+        Log.i(TAG, message)
+        publishState()
+    }
+
+    private fun exitCallHold() {
+        if (!joined || !onHold) return
+        onHold = false
+        val restoreTalking = talkingBeforeHold
+        talkingBeforeHold = false
+        talking = restoreTalking
+        runCatching {
+            engine?.muteAllRemoteAudioStreams(false)
+            applyAudioState(restoreTalking)
+        }.onFailure { error ->
+            talking = false
+            message = "Voice resume failed: ${error.safeMessage()}"
+            Log.e(TAG, message, error)
+            publishState()
+            return
+        }
+        message = if (restoreTalking) "Talking to group" else "Listening to group"
+        Log.i(TAG, "Walkie talkie resumed after phone call. talking=$restoreTalking")
+        publishState()
+    }
+
+    private fun applyAudioState(publishMic: Boolean) {
+        engine?.muteLocalAudioStream(!publishMic)
+        engine?.updateChannelMediaOptions(ChannelMediaOptions().apply {
+            channelProfile = Constants.CHANNEL_PROFILE_COMMUNICATION
+            clientRoleType = Constants.CLIENT_ROLE_BROADCASTER
+            publishMicrophoneTrack = publishMic
+            autoSubscribeAudio = true
+        })
     }
 
     private fun publishState() {

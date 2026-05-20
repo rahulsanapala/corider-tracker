@@ -28,6 +28,7 @@ android {
         versionName = "0.1.0"
         buildConfigField("String", "AGORA_APP_ID", "\"${configValue("AGORA_APP_ID")}\"")
         buildConfigField("String", "AGORA_TOKEN", "\"${configValue("AGORA_TOKEN")}\"")
+        buildConfigField("String", "GOOGLE_WEB_CLIENT_ID", "\"${configValue("GOOGLE_WEB_CLIENT_ID")}\"")
     }
 
     compileOptions {
@@ -55,6 +56,9 @@ dependencies {
     implementation(platform("com.google.firebase:firebase-bom:34.2.0"))
     implementation("com.google.firebase:firebase-auth")
     implementation("com.google.firebase:firebase-database")
+    implementation("androidx.credentials:credentials:1.5.0")
+    implementation("androidx.credentials:credentials-play-services-auth:1.5.0")
+    implementation("com.google.android.libraries.identity.googleid:googleid:1.1.1")
     implementation("com.google.android.material:material:1.14.0")
     implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.2.0")
     implementation("io.agora.rtc:voice-rtc-basic:4.6.3")
