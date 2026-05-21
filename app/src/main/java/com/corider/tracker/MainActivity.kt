@@ -10,7 +10,13 @@ import android.content.Intent
 import android.content.res.ColorStateList
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.BitmapShader
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.location.Location
@@ -75,6 +81,8 @@ import com.google.firebase.database.DatabaseError
 import com.google.firebase.database.DatabaseReference
 import com.google.firebase.database.FirebaseDatabase
 import com.google.firebase.database.ValueEventListener
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -98,10 +106,15 @@ class MainActivity : Activity(), RideBus.Listener {
     private lateinit var profileBloodInput: Spinner
     private lateinit var profileBikeInput: EditText
     private lateinit var profileEmergencyInput: EditText
+    private lateinit var profilePhotoView: ImageView
     private lateinit var profileTitleView: TextView
     private lateinit var profileSubtitleView: TextView
+    private lateinit var profileFriendsCountView: TextView
     private lateinit var googleAuthStatusView: TextView
     private lateinit var googleAuthButton: Button
+    private lateinit var loginGate: FrameLayout
+    private lateinit var loginGateStatusView: TextView
+    private lateinit var loginGateButton: Button
     private lateinit var batteryStatusView: TextView
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
@@ -114,6 +127,9 @@ class MainActivity : Activity(), RideBus.Listener {
     private lateinit var sosButton: Button
     private lateinit var regroupButton: Button
     private lateinit var sosSafeButton: ImageButton
+    private lateinit var eventPinsToggle: FrameLayout
+    private lateinit var eventPinsToggleLabel: TextView
+    private lateinit var eventPinsToggleKnob: View
     private lateinit var mapSearchPanel: LinearLayout
     private lateinit var destinationSearchInput: EditText
     private lateinit var routeInfoPill: TextView
@@ -189,6 +205,12 @@ class MainActivity : Activity(), RideBus.Listener {
     private var selectedRiderActionId: String? = null
     private val mapNavigationClient = MapNavigationClient()
     private val mapNavigationExecutor = Executors.newSingleThreadExecutor()
+    private val profilePhotoExecutor = Executors.newSingleThreadExecutor()
+    private var profilePhotoLoadToken = 0
+    private var cachedProfilePhotoUrl = ""
+    private var cachedProfilePhotoBitmap: Bitmap? = null
+    private val profileFriends = LinkedHashMap<String, FriendProfile>()
+    private var profileFriendsRequestId = 0
     private var selectedDestination: PlaceSearchResult? = null
     private var pendingRouteDestination: PlaceSearchResult? = null
     private var mapNavigationRequestId = 0
@@ -201,6 +223,7 @@ class MainActivity : Activity(), RideBus.Listener {
     private var selectedEventLatE7: Int? = null
     private var selectedEventLonE7: Int? = null
     private var eventLocationRequestId = 0
+    private var eventPinsVisible = true
     private lateinit var credentialManager: CredentialManager
     private val mainThreadExecutor = Executor { command -> runOnUiThread(command) }
 
@@ -209,14 +232,16 @@ class MainActivity : Activity(), RideBus.Listener {
         super.onCreate(savedInstanceState)
         credentialManager = CredentialManager.create(this)
         resetLegacyIdentityDataIfNeeded()
+        eventPinsVisible = prefs.getBoolean(KEY_MAP_EVENTS_VISIBLE, true)
         adminGroups.addAll(loadLocalAdminGroups())
         walkieTalkie.onStateChanged = { state ->
             syncWalkieForeground(state)
             runOnUiThread { renderWalkieState(state) }
         }
         buildUi()
-        startGlobalEventsListener()
+        if (currentGoogleUid() != null) startGlobalEventsListener()
         handleJoinIntent(intent)
+        updateLoginGate()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -236,6 +261,7 @@ class MainActivity : Activity(), RideBus.Listener {
     override fun onResume() {
         super.onResume()
         if (::mapView.isInitialized) mapView.onResume()
+        updateLoginGate()
         if (selectedTab == "profile") updateBatteryStatus()
         refreshActiveTracking()
         requestPreviewLocationIfNeeded()
@@ -265,6 +291,7 @@ class MainActivity : Activity(), RideBus.Listener {
         WalkieTalkieSession.releaseIfIdle(this)
         if (::mapView.isInitialized) mapView.onDestroy()
         mapNavigationExecutor.shutdownNow()
+        profilePhotoExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -304,11 +331,15 @@ class MainActivity : Activity(), RideBus.Listener {
     }
 
     private fun buildUi() {
+        val appRoot = FrameLayout(this).apply {
+            setBackgroundColor(SURFACE)
+        }
+        applySystemBars(appRoot)
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(SURFACE)
         }
-        applySystemBars(root)
 
         topBar = buildTopBar()
         root.addView(topBar, LinearLayout.LayoutParams.MATCH_PARENT, dp(64))
@@ -328,8 +359,85 @@ class MainActivity : Activity(), RideBus.Listener {
 
         root.addView(buildBottomNav(), LinearLayout.LayoutParams.MATCH_PARENT, dp(64))
 
-        setContentView(root)
+        appRoot.addView(root, FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+        loginGate = buildLoginGate()
+        appRoot.addView(loginGate, FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+
+        setContentView(appRoot)
         switchTab("map")
+        updateLoginGate()
+    }
+
+    private fun buildLoginGate(): FrameLayout {
+        return FrameLayout(this).apply {
+            setBackgroundColor(SURFACE)
+            isClickable = true
+            isFocusable = true
+            visibility = View.GONE
+
+            val panel = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(dp(22), dp(24), dp(22), dp(24))
+                background = gradientRounded(Color.rgb(10, 15, 24), Color.rgb(17, 24, 39), dp(18), stroke = Color.rgb(59, 130, 246), strokeWidth = 1)
+                elevation = dp(12).toFloat()
+            }
+
+            panel.addView(TextView(this@MainActivity).apply {
+                text = "CoRider"
+                textSize = 28f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+            }, matchWrapNoMargin())
+
+            panel.addView(TextView(this@MainActivity).apply {
+                text = "Sign in to continue"
+                textSize = 15f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.rgb(191, 219, 254))
+                gravity = Gravity.CENTER
+                setPadding(0, dp(8), 0, 0)
+            }, matchWrapNoMargin())
+
+            loginGateStatusView = TextView(this@MainActivity).apply {
+                text = "Google login is required before using groups, events, maps, and walkie talkie."
+                textSize = 13f
+                setTextColor(Color.rgb(203, 213, 225))
+                gravity = Gravity.CENTER
+                setPadding(0, dp(12), 0, 0)
+                setLineSpacing(dp(2).toFloat(), 1.0f)
+            }
+            panel.addView(loginGateStatusView, matchWrapNoMargin())
+
+            loginGateButton = smallCommand("SIGN IN WITH GOOGLE", BLUE).apply {
+                minHeight = dp(52)
+                setOnClickListener { signInWithGoogle() }
+            }
+            panel.addView(loginGateButton, matchWrap(top = 18))
+
+            addView(
+                panel,
+                FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT).apply {
+                    gravity = Gravity.CENTER
+                    leftMargin = dp(22)
+                    rightMargin = dp(22)
+                }
+            )
+        }
+    }
+
+    private fun updateLoginGate() {
+        if (!::loginGate.isInitialized) return
+        val signedIn = currentGoogleUid() != null
+        loginGate.visibility = if (signedIn) View.GONE else View.VISIBLE
+        if (!signedIn && ::loginGateStatusView.isInitialized) {
+            loginGateStatusView.text = "Google login is required before using groups, events, maps, and walkie talkie."
+        }
+        if (::loginGateButton.isInitialized) {
+            loginGateButton.isEnabled = true
+            loginGateButton.text = "SIGN IN WITH GOOGLE"
+        }
     }
 
     private fun buildTopBar(): LinearLayout {
@@ -430,11 +538,17 @@ class MainActivity : Activity(), RideBus.Listener {
             }
             val safeParams = overlayParams(Gravity.TOP or Gravity.END, right = 22, top = 160, width = 58, height = 58)
             addView(sosSafeButton, safeParams)
+            eventPinsToggle = buildEventPinsToggle()
+            addView(eventPinsToggle, overlayParams(Gravity.TOP or Gravity.END, right = 18, top = 104, width = 92, height = 32))
             addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
                 val top = (height / 4).coerceAtLeast(dp(96))
                 (sosSafeButton.layoutParams as FrameLayout.LayoutParams).apply {
                     topMargin = top
                     sosSafeButton.layoutParams = this
+                }
+                (eventPinsToggle.layoutParams as FrameLayout.LayoutParams).apply {
+                    topMargin = (top - dp(54)).coerceAtLeast(dp(82))
+                    eventPinsToggle.layoutParams = this
                 }
             }
 
@@ -1383,12 +1497,17 @@ class MainActivity : Activity(), RideBus.Listener {
             .setTitle("Event details")
             .setView(content)
             .setPositiveButton("Close", null)
+            .setNeutralButton("Show map", null)
         if (canDeleteEvent(event)) {
             builder.setNegativeButton("Delete", null)
         }
 
         val dialog = builder.create()
         dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                dialog.dismiss()
+                showEventOnMap(event)
+            }
             val deleteButton = dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
             if (deleteButton != null) {
                 deleteButton.setTextColor(RED)
@@ -1398,6 +1517,16 @@ class MainActivity : Activity(), RideBus.Listener {
             }
         }
         dialog.show()
+    }
+
+    private fun showEventOnMap(event: BikeEvent) {
+        if (!eventPinsVisible) {
+            eventPinsVisible = true
+            prefs.edit().putBoolean(KEY_MAP_EVENTS_VISIBLE, true).apply()
+        }
+        switchTab("map")
+        applyEventPinVisibility()
+        mapView.focusOnEvent(event.id)
     }
 
     private fun canDeleteEvent(event: BikeEvent): Boolean {
@@ -1433,7 +1562,7 @@ class MainActivity : Activity(), RideBus.Listener {
                     globalBikeEvents.remove(event.id)
                     renderEventsPage()
                     if (::mapView.isInitialized) {
-                        mapView.setGlobalEvents(globalBikeEvents.values, show = !rideActive)
+                        applyEventPinVisibility()
                     }
                     statusView.text = "Event deleted."
                 }
@@ -1494,7 +1623,7 @@ class MainActivity : Activity(), RideBus.Listener {
             .forEach { globalBikeEvents[it.id] = it }
         renderEventsPage()
         if (::mapView.isInitialized) {
-            mapView.setGlobalEvents(globalBikeEvents.values, show = !rideActive)
+            applyEventPinVisibility()
         }
     }
 
@@ -1544,7 +1673,14 @@ class MainActivity : Activity(), RideBus.Listener {
             background = gradientRounded(Color.rgb(96, 34, 197), Color.rgb(37, 99, 235), dp(18))
             elevation = dp(5).toFloat()
         }
+        createProfileInputsFromPrefs()
         val initialProfileName = prefs.getString(KEY_RIDER_NAME, "").orEmpty().ifBlank { "Rider" }
+        profilePhotoView = ImageView(this).apply {
+            contentDescription = "Google profile photo"
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            background = oval(Color.WHITE, stroke = Color.argb(115, 255, 255, 255), strokeWidth = 2)
+            elevation = dp(8).toFloat()
+        }
         profileTitleView = TextView(this).apply {
             text = initialProfileName
             textSize = 18f
@@ -1560,28 +1696,39 @@ class MainActivity : Activity(), RideBus.Listener {
             gravity = Gravity.CENTER
             setPadding(0, dp(3), 0, dp(12))
         }
-        val personalCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(14), dp(14), dp(14))
-            background = rounded(Color.WHITE, dp(13), stroke = Color.rgb(226, 232, 240))
-            elevation = dp(4).toFloat()
-        }
-        personalCard.addView(TextView(this).apply {
-            text = "Personal Info"
-            textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.rgb(15, 23, 42))
-        }, matchWrapNoMargin())
+        profilePanel.addView(
+            profilePhotoView,
+            LinearLayout.LayoutParams(dp(82), dp(82)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                bottomMargin = dp(10)
+            }
+        )
+        updateProfilePhotoUi()
+        profilePanel.addView(profileNameRow(), matchWrapNoMargin())
+        profilePanel.addView(profileStatsRow(), matchWrap(top = 12))
+        content.addView(profilePanel, matchWrapNoMargin())
 
-        googleAuthStatusView = TextView(this).apply {
-            textSize = 13f
-            setTextColor(Color.rgb(71, 85, 105))
-            setPadding(0, dp(8), 0, 0)
+        val batteryPanel = panel()
+        batteryPanel.addView(sectionTitle("BATTERY & BACKGROUND"), matchWrapNoMargin())
+        batteryStatusView = bodyText(batteryOptimizationStatus()).apply {
+            setTextColor(if (isBatteryOptimizationIgnored()) GREEN else AMBER)
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        batteryPanel.addView(batteryStatusView, matchWrap(top = 8))
+        val batteryButton = smallCommand("BATTERY SETTINGS", BLUE).apply {
+            setOnClickListener { openBatterySettings() }
+            styleProfileSettingsButton()
+        }
+        batteryPanel.addView(batteryButton, matchWrap(top = 12))
+        content.addView(batteryPanel, matchWrap(top = 18))
+
+        val accountPanel = panel()
+        accountPanel.addView(sectionTitle("ACCOUNT"), matchWrapNoMargin())
+        googleAuthStatusView = bodyText("").apply {
             setLineSpacing(dp(2).toFloat(), 1.0f)
         }
-        personalCard.addView(googleAuthStatusView, matchWrapNoMargin())
-
-        googleAuthButton = smallCommand("SIGN IN WITH GOOGLE", BLUE).apply {
+        accountPanel.addView(googleAuthStatusView, matchWrap(top = 8))
+        googleAuthButton = smallCommand("SIGN OUT GOOGLE", RED).apply {
             setOnClickListener {
                 if (isGoogleSignedIn()) {
                     signOutGoogle()
@@ -1590,8 +1737,20 @@ class MainActivity : Activity(), RideBus.Listener {
                 }
             }
         }
-        personalCard.addView(googleAuthButton, matchWrap(top = 12))
+        accountPanel.addView(googleAuthButton, matchWrap(top = 12))
+        content.addView(accountPanel, matchWrap(top = 18))
+        updateGoogleAuthUi()
+        refreshProfileFriends()
 
+        return ScrollView(this).apply {
+            setBackgroundColor(SURFACE)
+            clipToPadding = false
+            isFillViewport = true
+            addView(content)
+        }
+    }
+
+    private fun createProfileInputsFromPrefs() {
         profileNameInput = profileInput("Full name", prefs.getString(KEY_RIDER_NAME, "").orEmpty()).apply {
             filters = arrayOf(lettersAndSpacesFilter(), InputFilter.LengthFilter(40))
         }
@@ -1604,9 +1763,7 @@ class MainActivity : Activity(), RideBus.Listener {
             keyListener = null
             isFocusable = false
             isCursorVisible = false
-            setOnClickListener {
-                if (profileEditMode) showDobPicker()
-            }
+            setOnClickListener { showDobPicker() }
         }
         profileBloodInput = bloodGroupDropdown(prefs.getString(KEY_BLOOD_GROUP, "").orEmpty())
         profileBikeInput = profileInput("Bike / vehicle", prefs.getString(KEY_BIKE, "").orEmpty())
@@ -1614,72 +1771,360 @@ class MainActivity : Activity(), RideBus.Listener {
             inputType = InputType.TYPE_CLASS_PHONE
             filters = arrayOf(digitsOnlyFilter(), InputFilter.LengthFilter(10))
         }
+    }
 
-        personalCard.addView(profileNameInput, matchWrap(top = 12))
-        personalCard.addView(profileContactInput, matchWrap(top = 10))
-        personalCard.addView(profileDobInput, matchWrap(top = 10))
-        personalCard.addView(profileBloodInput, matchWrap(top = 10))
-        personalCard.addView(profileBikeInput, matchWrap(top = 10))
-        personalCard.addView(profileEmergencyInput, matchWrap(top = 10))
-
-        val saveButton = smallCommand("EDIT PROFILE", BLUE).apply {
-            setOnClickListener {
-                if (!profileEditMode) {
-                    setProfileEditMode(true, this)
-                    statusView.text = "Edit profile details."
-                } else if (validateProfileInputs()) {
-                    saveProfile()
-                    hideKeyboard(this)
-                    setProfileEditMode(false, this)
-                    profileTitleView.text = profileName()
-                    statusView.text = "Details updated. Your map name is ${profileName()}."
+    private fun profileNameRow(): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            addView(
+                profileTitleView,
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            )
+            addView(
+                ImageButton(this@MainActivity).apply {
+                    contentDescription = "Edit profile details"
+                    setImageResource(R.drawable.ic_edit_pencil)
+                    setColorFilter(Color.WHITE)
+                    scaleType = ImageView.ScaleType.CENTER
+                    setPadding(dp(8), dp(8), dp(8), dp(8))
+                    background = oval(Color.argb(80, 255, 255, 255), stroke = Color.argb(105, 255, 255, 255))
+                    setOnClickListener { showEditProfileDialog() }
+                },
+                LinearLayout.LayoutParams(dp(38), dp(38)).apply {
+                    leftMargin = dp(8)
                 }
+            )
+        }
+    }
+
+    private fun profileStatsRow(): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            addView(
+                profileFriendStat(),
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            )
+        }
+    }
+
+    private fun profileFriendStat(): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            isClickable = true
+            isFocusable = true
+            setPadding(dp(22), dp(8), dp(22), dp(8))
+            background = rounded(Color.argb(45, 255, 255, 255), dp(14), stroke = Color.argb(65, 255, 255, 255))
+            setOnClickListener { showFriendsListLayout() }
+
+            profileFriendsCountView = TextView(context).apply {
+                text = "0"
+                textSize = 21f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+                includeFontPadding = false
+            }
+            addView(profileFriendsCountView, matchWrapNoMargin())
+
+            addView(TextView(context).apply {
+                text = "friends"
+                textSize = 12f
+                setTextColor(Color.rgb(219, 234, 254))
+                gravity = Gravity.CENTER
+                includeFontPadding = false
+                setPadding(0, dp(3), 0, 0)
+            }, matchWrapNoMargin())
+        }
+    }
+
+    private fun showEditProfileDialog() {
+        createProfileInputsFromPrefs()
+        profileEditMode = true
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(8), dp(6), dp(8), dp(2))
+            addView(profileNameInput, matchWrap(top = 6))
+            addView(profileContactInput, matchWrap(top = 10))
+            addView(profileDobInput, matchWrap(top = 10))
+            addView(profileBloodInput, matchWrap(top = 10))
+            addView(profileBikeInput, matchWrap(top = 10))
+            addView(profileEmergencyInput, matchWrap(top = 10))
+        }
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Edit profile")
+            .setView(content)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Save", null)
+            .create()
+
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                if (!validateProfileInputs()) return@setOnClickListener
+                saveProfile()
+                hideKeyboard(profileNameInput)
+                profileTitleView.text = profileName()
+                profileEditMode = false
+                dialog.dismiss()
+                statusView.text = "Details updated. Your map name is ${profileName()}."
+                refreshProfileFriends()
             }
         }
-        personalCard.addView(saveButton, matchWrap(top = 14))
-        setProfileEditMode(false, saveButton)
-        updateGoogleAuthUi()
-        profilePanel.addView(profileTitleView, matchWrapNoMargin())
-        profilePanel.addView(profileSubtitleView, matchWrapNoMargin())
-        profilePanel.addView(personalCard, matchWrapNoMargin())
-        content.addView(profilePanel, matchWrapNoMargin())
+        dialog.setOnDismissListener { profileEditMode = false }
+        dialog.show()
+    }
 
-        val batteryPanel = panel()
-        batteryPanel.addView(sectionTitle("BATTERY & BACKGROUND"), matchWrapNoMargin())
-        batteryStatusView = bodyText(batteryOptimizationStatus()).apply {
-            setTextColor(if (isBatteryOptimizationIgnored()) GREEN else AMBER)
-            typeface = Typeface.DEFAULT_BOLD
+    private fun refreshProfileFriends() {
+        if (!::profileFriendsCountView.isInitialized) return
+        val requestId = ++profileFriendsRequestId
+        renderProfileFriends(loading = true)
+
+        val candidates = LinkedHashMap<String, RiderSnapshot>()
+        fun remember(snapshot: RiderSnapshot) {
+            if (snapshot.id.isNotBlank() && snapshot.id != riderId) {
+                candidates[snapshot.id] = snapshot
+            }
         }
-        batteryPanel.addView(batteryStatusView, matchWrap(top = 8))
-        batteryPanel.addView(
-            bodyText("For Redmi: set Battery saver to No restrictions, enable Auto start, and keep CoRider locked in recent apps."),
-            matchWrap(top = 8)
+        currentState.riders.values.forEach { remember(it) }
+
+        val groups = loadGroups()
+        var pendingGroups = groups.size
+        fun finishGroups() {
+            if (requestId != profileFriendsRequestId) return
+            loadProfileFriendDetails(requestId, candidates)
+        }
+        if (pendingGroups == 0) {
+            finishGroups()
+            return
+        }
+
+        groups.forEach { group ->
+            FirebaseDatabase.getInstance()
+                .getReference("rides/${group.code}/riders")
+                .get()
+                .addOnCompleteListener { task ->
+                    if (requestId != profileFriendsRequestId) return@addOnCompleteListener
+                    if (task.isSuccessful) {
+                        task.result?.children?.forEach { snapshot ->
+                            readRiderSnapshot(snapshot)?.let { remember(it) }
+                        }
+                    }
+                    pendingGroups -= 1
+                    if (pendingGroups == 0) finishGroups()
+                }
+        }
+    }
+
+    private fun loadProfileFriendDetails(requestId: Int, candidates: Map<String, RiderSnapshot>) {
+        if (candidates.isEmpty()) {
+            profileFriends.clear()
+            renderProfileFriends()
+            return
+        }
+
+        val loaded = LinkedHashMap<String, FriendProfile>()
+        var pendingProfiles = candidates.size
+        candidates.forEach { (uid, snapshot) ->
+            FirebaseDatabase.getInstance()
+                .getReference("$USER_PROFILES_PATH/$uid")
+                .get()
+                .addOnCompleteListener { task ->
+                    if (requestId != profileFriendsRequestId) return@addOnCompleteListener
+                    loaded[uid] = if (task.isSuccessful) {
+                        readFriendProfile(uid, task.result, snapshot)
+                    } else {
+                        fallbackFriendProfile(uid, snapshot)
+                    }
+                    pendingProfiles -= 1
+                    if (pendingProfiles == 0) {
+                        profileFriends.clear()
+                        profileFriends.putAll(loaded)
+                        renderProfileFriends()
+                    }
+                }
+        }
+    }
+
+    private fun renderProfileFriends(loading: Boolean = false) {
+        if (!::profileFriendsCountView.isInitialized) return
+        val friends = profileFriends.values
+            .filter { it.uid != riderId }
+            .sortedBy { it.name.lowercase(Locale.US) }
+        profileFriendsCountView.text = friends.size.toString()
+    }
+
+    private fun showFriendsListLayout() {
+        refreshProfileFriends()
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(6), dp(4), dp(6), 0)
+        }
+        val friends = profileFriends.values
+            .filter { it.uid != riderId }
+            .sortedBy { it.name.lowercase(Locale.US) }
+        if (friends.isEmpty()) {
+            content.addView(friendMessageView("No friends yet", "Riders from your groups will appear here after they join and save their profile."), matchWrapNoMargin())
+        } else {
+            friends.forEachIndexed { index, friend ->
+                content.addView(friendItemView(friend), matchWrap(top = if (index == 0) 0 else 10))
+            }
+        }
+        AlertDialog.Builder(this)
+            .setTitle("${friends.size} ${if (friends.size == 1) "friend" else "friends"}")
+            .setView(content)
+            .setPositiveButton("Close", null)
+            .show()
+    }
+
+    private fun friendItemView(friend: FriendProfile): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            isClickable = true
+            isFocusable = true
+            setPadding(dp(12), dp(11), dp(12), dp(11))
+            background = rounded(Color.rgb(23, 28, 35), dp(12), stroke = CARD_STROKE)
+            setOnClickListener { showFriendProfileDialog(friend) }
+
+            addView(TextView(context).apply {
+                text = friendInitials(friend.name)
+                textSize = 13f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+                background = oval(BLUE, stroke = Color.rgb(147, 197, 253))
+            }, LinearLayout.LayoutParams(dp(42), dp(42)))
+
+            val textColumn = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(12), 0, 0, 0)
+            }
+            textColumn.addView(TextView(context).apply {
+                text = friend.name.ifBlank { "Rider" }
+                textSize = 15f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.WHITE)
+                maxLines = 1
+            }, matchWrapNoMargin())
+            textColumn.addView(TextView(context).apply {
+                text = listOfNotNull(
+                    friend.contact.takeIf { it.isNotBlank() }?.let { "Mobile $it" },
+                    friend.bloodGroup.takeIf { it.isNotBlank() }?.let { "Blood $it" }
+                ).ifEmpty { listOf("Details not shared yet") }.joinToString("  /  ")
+                textSize = 12.5f
+                setTextColor(MUTED)
+                maxLines = 1
+                setPadding(0, dp(3), 0, 0)
+            }, matchWrapNoMargin())
+            addView(textColumn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
+    }
+
+    private fun friendMessageView(titleText: String, body: String): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = rounded(Color.rgb(23, 28, 35), dp(12), stroke = CARD_STROKE)
+            addView(TextView(context).apply {
+                text = titleText
+                textSize = 14f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.WHITE)
+            }, matchWrapNoMargin())
+            addView(bodyText(body), matchWrap(top = 4))
+        }
+    }
+
+    private fun showFriendProfileDialog(friend: FriendProfile) {
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(8), dp(4), dp(8), 0)
+            addView(friendDetailCard("Mobile", friend.contact.ifBlank { "Not shared" }), matchWrap(top = 8))
+            addView(friendDetailCard("Blood group", friend.bloodGroup.ifBlank { "Not shared" }), matchWrap(top = 8))
+            addView(friendDetailCard("Emergency contact", friend.emergencyContact.ifBlank { "Not shared" }), matchWrap(top = 8))
+            addView(friendDetailCard("Bike", friend.bike.ifBlank { "Not shared" }), matchWrap(top = 8))
+            addView(friendDetailCard("Email", friend.email.ifBlank { "Not shared" }), matchWrap(top = 8))
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(friend.name.ifBlank { "Rider profile" })
+            .setView(content)
+            .setPositiveButton("Close", null)
+            .create()
+        if (friend.contact.isNotBlank()) {
+            dialog.setButton(AlertDialog.BUTTON_NEUTRAL, "Call") { _, _ ->
+                startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${friend.contact}")))
+            }
+        }
+        dialog.show()
+    }
+
+    private fun friendDetailCard(label: String, value: String): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = rounded(Color.rgb(248, 250, 252), dp(10), stroke = Color.rgb(226, 232, 240))
+            addView(TextView(context).apply {
+                text = label
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.rgb(100, 116, 139))
+            }, matchWrapNoMargin())
+            addView(TextView(context).apply {
+                text = value
+                textSize = 15f
+                setTextColor(Color.rgb(15, 23, 42))
+                setPadding(0, dp(4), 0, 0)
+            }, matchWrapNoMargin())
+        }
+    }
+
+    private fun readRiderSnapshot(snapshot: DataSnapshot): RiderSnapshot? {
+        val id = snapshot.child("id").getValue(String::class.java).orEmpty().ifBlank { snapshot.key.orEmpty() }
+        val name = snapshot.child("name").getValue(String::class.java).orEmpty()
+        val lat = dataLong(snapshot, "latE7")?.toInt() ?: return null
+        val lon = dataLong(snapshot, "lonE7")?.toInt() ?: return null
+        val speed = dataLong(snapshot, "speedCentiMps")?.toInt() ?: 0
+        val bearing = dataLong(snapshot, "bearingDeg")?.toInt() ?: -1
+        val accuracy = dataLong(snapshot, "accuracyM")?.toInt() ?: -1
+        val updatedAt = dataLong(snapshot, "updatedAtMs") ?: 0L
+        val stationarySince = dataLong(snapshot, "stationarySinceMs") ?: 0L
+        if (id.isBlank()) return null
+        return RiderSnapshot(id, name, lat, lon, speed, bearing, accuracy, updatedAt, stationarySince)
+    }
+
+    private fun readFriendProfile(uid: String, snapshot: DataSnapshot?, fallback: RiderSnapshot): FriendProfile {
+        if (snapshot == null || !snapshot.exists()) return fallbackFriendProfile(uid, fallback)
+        return FriendProfile(
+            uid = uid,
+            name = snapshot.child("name").getValue(String::class.java).orEmpty().ifBlank { fallback.label },
+            contact = snapshot.child("contact").getValue(String::class.java).orEmpty(),
+            dob = snapshot.child("dob").getValue(String::class.java).orEmpty(),
+            bloodGroup = snapshot.child("bloodGroup").getValue(String::class.java).orEmpty(),
+            bike = snapshot.child("bike").getValue(String::class.java).orEmpty(),
+            emergencyContact = snapshot.child("emergencyContact").getValue(String::class.java).orEmpty(),
+            email = snapshot.child("email").getValue(String::class.java).orEmpty(),
+            photoUrl = snapshot.child("photoUrl").getValue(String::class.java).orEmpty()
         )
+    }
 
-        val batteryButton = smallCommand("BATTERY SETTINGS", BLUE).apply {
-            setOnClickListener { openBatterySettings() }
-            styleProfileSettingsButton()
-        }
-        val appButton = smallCommand("APP SETTINGS", PILL).apply {
-            setOnClickListener { openAppSettings() }
-            styleProfileSettingsButton()
-        }
-        batteryPanel.addView(batteryButton, matchWrap(top = 12))
-        batteryPanel.addView(appButton, matchWrap(top = 10))
+    private fun fallbackFriendProfile(uid: String, snapshot: RiderSnapshot): FriendProfile {
+        return FriendProfile(uid = uid, name = snapshot.label)
+    }
 
-        val redmiButton = smallCommand("REDMI AUTOSTART", GREEN).apply {
-            setOnClickListener { openRedmiAutostartSettings() }
-            styleProfileSettingsButton()
-        }
-        batteryPanel.addView(redmiButton, matchWrap(top = 10))
-        content.addView(batteryPanel, matchWrap(top = 18))
+    private fun friendInitials(name: String): String {
+        val words = name.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+        return words.take(2).joinToString("") { it.take(1).uppercase(Locale.US) }.ifBlank { "R" }
+    }
 
-        return ScrollView(this).apply {
-            setBackgroundColor(SURFACE)
-            clipToPadding = false
-            isFillViewport = true
-            addView(content)
-        }
+    private fun dataLong(snapshot: DataSnapshot, key: String): Long? {
+        val child = snapshot.child(key)
+        return child.getValue(Long::class.java)
+            ?: child.getValue(Int::class.java)?.toLong()
+            ?: child.getValue(Double::class.java)?.toLong()
     }
 
     private fun renderGroupList() {
@@ -2607,7 +3052,9 @@ class MainActivity : Activity(), RideBus.Listener {
         livePill.background = statusPill(state.active)
         mapSearchPanel.visibility = View.VISIBLE
         mapSearchPanel.bringToFront()
-        mapView.setGlobalEvents(globalBikeEvents.values, show = !state.active)
+        applyEventPinVisibility()
+        eventPinsToggle.visibility = View.VISIBLE
+        eventPinsToggle.bringToFront()
         sosButton.visibility = if (state.active) View.VISIBLE else View.GONE
         regroupButton.visibility = if (state.active) View.VISIBLE else View.GONE
         onlinePill.text = if (state.active) {
@@ -2628,6 +3075,46 @@ class MainActivity : Activity(), RideBus.Listener {
         ridersMiniView.text = riders.take(3).joinToString(separator = "\n") { rider ->
             val distance = if (own == null) "" else "  ${own.distanceTo(rider).toInt()} m"
             "${rider.label}$distance"
+        }
+    }
+
+    private fun toggleEventPins() {
+        eventPinsVisible = !eventPinsVisible
+        prefs.edit().putBoolean(KEY_MAP_EVENTS_VISIBLE, eventPinsVisible).apply()
+        applyEventPinVisibility()
+        statusView.text = if (eventPinsVisible) "Event pins shown." else "Event pins hidden."
+    }
+
+    private fun applyEventPinVisibility() {
+        if (!::mapView.isInitialized) return
+        mapView.setGlobalEvents(globalBikeEvents.values, show = eventPinsVisible)
+        updateEventPinsToggle()
+    }
+
+    private fun updateEventPinsToggle() {
+        if (!::eventPinsToggle.isInitialized || !::eventPinsToggleLabel.isInitialized || !::eventPinsToggleKnob.isInitialized) return
+        val active = eventPinsVisible
+        eventPinsToggle.background = rounded(
+            if (active) Color.rgb(74, 190, 123) else Color.rgb(203, 213, 225),
+            dp(16),
+            stroke = if (active) Color.rgb(52, 166, 103) else Color.rgb(148, 163, 184),
+            strokeWidth = 1
+        )
+        eventPinsToggle.alpha = 1f
+        eventPinsToggle.contentDescription = if (active) "Hide event pins" else "Show event pins"
+        eventPinsToggleLabel.text = if (active) "Hide events" else "Show events"
+        eventPinsToggleLabel.setTextColor(if (active) Color.WHITE else Color.rgb(55, 65, 81))
+        eventPinsToggleLabel.setPadding(
+            if (active) dp(5) else dp(26),
+            0,
+            if (active) dp(26) else dp(5),
+            0
+        )
+        (eventPinsToggleKnob.layoutParams as FrameLayout.LayoutParams).apply {
+            gravity = if (active) Gravity.END or Gravity.CENTER_VERTICAL else Gravity.START or Gravity.CENTER_VERTICAL
+            leftMargin = dp(3)
+            rightMargin = dp(3)
+            eventPinsToggleKnob.layoutParams = this
         }
     }
 
@@ -3099,7 +3586,10 @@ class MainActivity : Activity(), RideBus.Listener {
         }
         updateTopBarBackButton()
         if (tab == "events") renderEventsPage()
-        if (tab == "profile") updateBatteryStatus()
+        if (tab == "profile") {
+            updateBatteryStatus()
+            refreshProfileFriends()
+        }
         setupPanel.visibility = View.GONE
         styleBottomTabs()
     }
@@ -3182,7 +3672,31 @@ class MainActivity : Activity(), RideBus.Listener {
             .putString(KEY_BIKE, profileBikeInput.text.toString().trim())
             .putString(KEY_EMERGENCY_CONTACT, profileEmergencyInput.text.toString().trim())
             .apply()
+        publishUserProfile()
         syncActiveRiderName()
+    }
+
+    private fun publishUserProfile() {
+        val uid = currentGoogleUid().orEmpty()
+        if (uid.isBlank()) return
+        val user = FirebaseAuth.getInstance().currentUser
+        val photoUrl = user?.photoUrl?.toString().orEmpty().ifBlank { prefs.getString(KEY_GOOGLE_PHOTO_URL, "").orEmpty() }
+        val payload = mapOf(
+            "uid" to uid,
+            "name" to profileNameInput.text.toString().trim(),
+            "contact" to profileContactInput.text.toString().trim(),
+            "dob" to profileDobInput.text.toString().trim(),
+            "bloodGroup" to selectedBloodGroup(),
+            "bike" to profileBikeInput.text.toString().trim(),
+            "emergencyContact" to profileEmergencyInput.text.toString().trim(),
+            "email" to (user?.email ?: prefs.getString(KEY_GOOGLE_EMAIL, "").orEmpty()),
+            "photoUrl" to photoUrl,
+            "updatedAtMs" to System.currentTimeMillis()
+        )
+        FirebaseDatabase.getInstance()
+            .getReference(USER_PROFILES_PATH)
+            .child(uid)
+            .updateChildren(payload)
     }
 
     private fun setProfileEditMode(enabled: Boolean, button: Button? = null) {
@@ -3520,7 +4034,10 @@ class MainActivity : Activity(), RideBus.Listener {
     private fun requireGoogleIdentity(action: String): Boolean {
         if (currentGoogleUid() != null) return true
         statusView.text = "Sign in with Google to $action."
-        if (selectedTab != "profile") switchTab("profile")
+        updateLoginGate()
+        if (::loginGateStatusView.isInitialized) {
+            loginGateStatusView.text = "Sign in with Google to $action."
+        }
         return false
     }
 
@@ -3558,32 +4075,41 @@ class MainActivity : Activity(), RideBus.Listener {
             .remove(KEY_EMERGENCY_CONTACT)
             .remove(KEY_GOOGLE_EMAIL)
             .remove(KEY_GOOGLE_UID)
+            .remove(KEY_GOOGLE_PHOTO_URL)
             .putBoolean(KEY_GOOGLE_IDENTITY_RESET_DONE, true)
             .apply()
     }
 
     private fun withFirebaseAuth(block: () -> Unit) {
-        val auth = FirebaseAuth.getInstance()
-        if (auth.currentUser != null) {
+        if (currentGoogleUid() != null) {
             block()
             return
         }
-        auth.signInAnonymously()
-            .addOnSuccessListener { block() }
-            .addOnFailureListener { error ->
-                statusView.text = "Firebase auth failed: ${error.message ?: "unknown"}"
-            }
+        statusView.text = "Sign in with Google to continue."
+        updateLoginGate()
     }
 
     private fun signInWithGoogle() {
         val clientId = googleWebClientId()
         if (clientId.isBlank()) {
+            if (::loginGateStatusView.isInitialized) {
+                loginGateStatusView.text = "Google sign-in setup is missing. Add the Web Client ID and rebuild."
+            }
             showGoogleSetupDialog()
             return
         }
 
-        googleAuthButton.isEnabled = false
-        googleAuthButton.text = "SIGNING IN..."
+        if (::googleAuthButton.isInitialized) {
+            googleAuthButton.isEnabled = false
+            googleAuthButton.text = "SIGNING IN..."
+        }
+        if (::loginGateButton.isInitialized) {
+            loginGateButton.isEnabled = false
+            loginGateButton.text = "SIGNING IN..."
+        }
+        if (::loginGateStatusView.isInitialized) {
+            loginGateStatusView.text = "Opening Google sign-in..."
+        }
         statusView.text = "Opening Google sign-in..."
 
         val googleIdOption = GetGoogleIdOption.Builder()
@@ -3606,9 +4132,14 @@ class MainActivity : Activity(), RideBus.Listener {
                 }
 
                 override fun onError(e: GetCredentialException) {
-                    googleAuthButton.isEnabled = true
+                    if (::googleAuthButton.isInitialized) googleAuthButton.isEnabled = true
+                    if (::loginGateButton.isInitialized) loginGateButton.isEnabled = true
                     updateGoogleAuthUi()
+                    updateLoginGate()
                     statusView.text = "Google sign-in cancelled or failed."
+                    if (::loginGateStatusView.isInitialized) {
+                        loginGateStatusView.text = "Google sign-in cancelled. Sign in to continue."
+                    }
                 }
             }
         )
@@ -3619,8 +4150,10 @@ class MainActivity : Activity(), RideBus.Listener {
         if (credential !is CustomCredential ||
             credential.type != GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
         ) {
-            googleAuthButton.isEnabled = true
+            if (::googleAuthButton.isInitialized) googleAuthButton.isEnabled = true
+            if (::loginGateButton.isInitialized) loginGateButton.isEnabled = true
             updateGoogleAuthUi()
+            updateLoginGate()
             statusView.text = "Google sign-in returned an unsupported credential."
             return
         }
@@ -3628,8 +4161,10 @@ class MainActivity : Activity(), RideBus.Listener {
         val googleCredential = runCatching {
             GoogleIdTokenCredential.createFrom(credential.data)
         }.getOrElse { error ->
-            googleAuthButton.isEnabled = true
+            if (::googleAuthButton.isInitialized) googleAuthButton.isEnabled = true
+            if (::loginGateButton.isInitialized) loginGateButton.isEnabled = true
             updateGoogleAuthUi()
+            updateLoginGate()
             statusView.text = "Could not read Google account: ${error.message ?: "credential error"}"
             return
         }
@@ -3641,10 +4176,15 @@ class MainActivity : Activity(), RideBus.Listener {
             }
             .addOnFailureListener { error ->
                 statusView.text = "Google auth failed: ${error.message ?: "unknown"}"
+                if (::loginGateStatusView.isInitialized) {
+                    loginGateStatusView.text = "Google auth failed. Try again."
+                }
             }
             .addOnCompleteListener {
-                googleAuthButton.isEnabled = true
+                if (::googleAuthButton.isInitialized) googleAuthButton.isEnabled = true
+                if (::loginGateButton.isInitialized) loginGateButton.isEnabled = true
                 updateGoogleAuthUi()
+                updateLoginGate()
             }
     }
 
@@ -3660,12 +4200,17 @@ class MainActivity : Activity(), RideBus.Listener {
         if (googlePhone.isNotBlank()) {
             profileContactInput.setText(googlePhone)
         }
+        val googlePhotoUrl = user.photoUrl?.toString().orEmpty()
 
         prefs.edit()
             .putString(KEY_GOOGLE_EMAIL, user.email.orEmpty())
             .putString(KEY_GOOGLE_UID, user.uid)
+            .putString(KEY_GOOGLE_PHOTO_URL, googlePhotoUrl)
             .apply()
         saveProfile()
+        updateProfilePhotoUi()
+        startGlobalEventsListener()
+        updateLoginGate()
 
         val missing = mutableListOf<String>()
         if (googlePhone.isBlank()) missing.add("mobile number")
@@ -3678,14 +4223,19 @@ class MainActivity : Activity(), RideBus.Listener {
     }
 
     private fun signOutGoogle() {
+        stopGlobalEventsListener()
         FirebaseAuth.getInstance().signOut()
         prefs.edit()
             .remove(KEY_GOOGLE_EMAIL)
             .remove(KEY_GOOGLE_UID)
+            .remove(KEY_GOOGLE_PHOTO_URL)
             .apply()
+        cachedProfilePhotoUrl = ""
+        cachedProfilePhotoBitmap = null
         updateGoogleAuthUi()
-        statusView.text = "Google signed out. Guest Firebase auth will continue."
-        withFirebaseAuth {}
+        updateProfilePhotoUi()
+        updateLoginGate()
+        statusView.text = "Google signed out. Sign in to continue."
     }
 
     private fun updateGoogleAuthUi() {
@@ -3704,6 +4254,86 @@ class MainActivity : Activity(), RideBus.Listener {
         if (::profileSubtitleView.isInitialized) {
             profileSubtitleView.text = if (signedIn && email.isNotBlank()) email else "Rider details"
         }
+        updateProfilePhotoUi()
+    }
+
+    private fun updateProfilePhotoUi() {
+        if (!::profilePhotoView.isInitialized) return
+        val userPhoto = FirebaseAuth.getInstance().currentUser?.photoUrl?.toString().orEmpty()
+        val photoUrl = userPhoto.ifBlank { prefs.getString(KEY_GOOGLE_PHOTO_URL, "").orEmpty() }
+
+        if (photoUrl.isBlank()) {
+            profilePhotoLoadToken++
+            setProfilePhotoPlaceholder()
+            return
+        }
+
+        cachedProfilePhotoBitmap?.takeIf { cachedProfilePhotoUrl == photoUrl }?.let { bitmap ->
+            profilePhotoView.clearColorFilter()
+            profilePhotoView.setPadding(0, 0, 0, 0)
+            profilePhotoView.setImageBitmap(bitmap)
+            return
+        }
+
+        setProfilePhotoPlaceholder()
+        val token = ++profilePhotoLoadToken
+        val targetSize = dp(82)
+        profilePhotoExecutor.execute {
+            val bitmap = loadCircularProfilePhoto(photoUrl, targetSize)
+            runOnUiThread {
+                if (token != profilePhotoLoadToken || !::profilePhotoView.isInitialized) return@runOnUiThread
+                if (bitmap == null) {
+                    setProfilePhotoPlaceholder()
+                } else {
+                    cachedProfilePhotoUrl = photoUrl
+                    cachedProfilePhotoBitmap = bitmap
+                    profilePhotoView.clearColorFilter()
+                    profilePhotoView.setPadding(0, 0, 0, 0)
+                    profilePhotoView.setImageBitmap(bitmap)
+                }
+            }
+        }
+    }
+
+    private fun setProfilePhotoPlaceholder() {
+        if (!::profilePhotoView.isInitialized) return
+        profilePhotoView.setImageResource(R.drawable.ic_nav_profile)
+        profilePhotoView.setColorFilter(BLUE)
+        profilePhotoView.setPadding(dp(18), dp(18), dp(18), dp(18))
+    }
+
+    private fun loadCircularProfilePhoto(photoUrl: String, targetSizePx: Int): Bitmap? {
+        return runCatching {
+            val connection = (URL(photoUrl).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 7_000
+                readTimeout = 7_000
+                instanceFollowRedirects = true
+            }
+            try {
+                connection.inputStream.use { stream ->
+                    BitmapFactory.decodeStream(stream)?.let { circularBitmap(it, targetSizePx) }
+                }
+            } finally {
+                connection.disconnect()
+            }
+        }.getOrNull()
+    }
+
+    private fun circularBitmap(source: Bitmap, sizePx: Int): Bitmap {
+        val side = minOf(source.width, source.height)
+        val left = ((source.width - side) / 2).coerceAtLeast(0)
+        val top = ((source.height - side) / 2).coerceAtLeast(0)
+        val cropped = Bitmap.createBitmap(source, left, top, side, side)
+        val scaled = Bitmap.createScaledBitmap(cropped, sizePx, sizePx, true)
+        if (cropped != source) cropped.recycle()
+
+        val output = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            shader = BitmapShader(scaled, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+        }
+        Canvas(output).drawCircle(sizePx / 2f, sizePx / 2f, sizePx / 2f, paint)
+        scaled.recycle()
+        return output
     }
 
     private fun isGoogleSignedIn(user: FirebaseUser? = FirebaseAuth.getInstance().currentUser): Boolean {
@@ -4010,6 +4640,43 @@ class MainActivity : Activity(), RideBus.Listener {
             background = rounded(fill, dp(8), stroke = CARD_STROKE)
             elevation = dp(3).toFloat()
             isAllCaps = false
+        }
+    }
+
+    private fun buildEventPinsToggle(): FrameLayout {
+        return FrameLayout(this).apply {
+            isClickable = true
+            isFocusable = true
+            elevation = dp(8).toFloat()
+            setPadding(dp(3), dp(3), dp(3), dp(3))
+            setOnClickListener { toggleEventPins() }
+
+            eventPinsToggleLabel = TextView(this@MainActivity).apply {
+                gravity = Gravity.CENTER
+                includeFontPadding = false
+                maxLines = 1
+                setSingleLine(true)
+                textSize = 8f
+                typeface = Typeface.DEFAULT_BOLD
+            }
+            addView(
+                eventPinsToggleLabel,
+                FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+            )
+
+            eventPinsToggleKnob = View(this@MainActivity).apply {
+                background = oval(Color.WHITE)
+                elevation = dp(5).toFloat()
+            }
+            addView(
+                eventPinsToggleKnob,
+                FrameLayout.LayoutParams(dp(22), dp(22)).apply {
+                    gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                    leftMargin = dp(3)
+                    rightMargin = dp(3)
+                }
+            )
+            updateEventPinsToggle()
         }
     }
 
@@ -4421,6 +5088,18 @@ class MainActivity : Activity(), RideBus.Listener {
         val name: String
     )
 
+    private data class FriendProfile(
+        val uid: String,
+        val name: String,
+        val contact: String = "",
+        val dob: String = "",
+        val bloodGroup: String = "",
+        val bike: String = "",
+        val emergencyContact: String = "",
+        val email: String = "",
+        val photoUrl: String = ""
+    )
+
     companion object {
         private const val REQUEST_PERMISSIONS = 41
         private const val REQUEST_AUDIO = 42
@@ -4446,11 +5125,14 @@ class MainActivity : Activity(), RideBus.Listener {
         private const val KEY_EMERGENCY_CONTACT = "emergency_contact"
         private const val KEY_GOOGLE_EMAIL = "google_email"
         private const val KEY_GOOGLE_UID = "google_uid"
+        private const val KEY_GOOGLE_PHOTO_URL = "google_photo_url"
         private const val KEY_GOOGLE_IDENTITY_RESET_DONE = "google_identity_reset_done_v1"
+        private const val KEY_MAP_EVENTS_VISIBLE = "map_events_visible"
         private const val INVITE_HOST = "rahulsanapala.github.io"
         private const val INVITE_PATH = "/corider-tracker/join.html"
         private const val ADMIN_ROLE_REFRESH_MS = 60_000L
         private const val GLOBAL_EVENTS_PATH = "globalBikeEvents"
+        private const val USER_PROFILES_PATH = "userProfiles"
         private const val EVENT_ADMIN_EMAIL = "sanapala.rahul02@gmail.com"
         private const val DEFAULT_MAP_PICKER_LATITUDE = 20.5937
         private const val DEFAULT_MAP_PICKER_LONGITUDE = 78.9629

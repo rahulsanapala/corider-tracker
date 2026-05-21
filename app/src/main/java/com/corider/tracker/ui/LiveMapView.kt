@@ -22,11 +22,13 @@ import com.corider.tracker.RiderSnapshot
 import com.corider.tracker.navigation.NavigationPoint
 import org.osmdroid.config.Configuration
 import org.osmdroid.events.MapListener
+import org.osmdroid.events.MapEventsReceiver
 import org.osmdroid.events.ScrollEvent
 import org.osmdroid.events.ZoomEvent
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.MapEventsOverlay
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polygon
 import org.osmdroid.views.overlay.Polyline
@@ -80,6 +82,19 @@ class LiveMapView(context: Context) : FrameLayout(context) {
             }
         }
         addView(sosArrow, LayoutParams(ARROW_SIZE_DP.dp(), ARROW_SIZE_DP.dp()))
+        mapView.overlays.add(
+            MapEventsOverlay(object : MapEventsReceiver {
+                override fun singleTapConfirmedHelper(point: GeoPoint?): Boolean {
+                    closeEventInfoWindows()
+                    return false
+                }
+
+                override fun longPressHelper(point: GeoPoint?): Boolean {
+                    closeEventInfoWindows()
+                    return false
+                }
+            })
+        )
         mapView.addMapListener(object : MapListener {
             override fun onScroll(event: ScrollEvent?): Boolean {
                 updateSosArrow()
@@ -194,6 +209,7 @@ class LiveMapView(context: Context) : FrameLayout(context) {
                 eventMarkers[event.id] = it
             }
             marker.position = GeoPoint(event.latitude, event.longitude)
+            marker.icon = eventPinDrawable(event.id)
             marker.title = event.name
             marker.subDescription = listOf(event.eventTime, event.locationName)
                 .filter { it.isNotBlank() }
@@ -215,6 +231,12 @@ class LiveMapView(context: Context) : FrameLayout(context) {
         mapView.controller.animateTo(marker.position)
         marker.showInfoWindow()
         return true
+    }
+
+    fun closeEventInfoWindows() {
+        eventMarkers.values.forEach { marker ->
+            if (marker.isInfoWindowShown) marker.closeInfoWindow()
+        }
     }
 
     fun focusOnSos(): Boolean {
@@ -521,8 +543,8 @@ class LiveMapView(context: Context) : FrameLayout(context) {
         val headR = size * 0.28f
         val color = EVENT_COLORS[(eventId.hashCode() and Int.MAX_VALUE) % EVENT_COLORS.size]
 
-        paint.color = Color.argb(85, 0, 0, 0)
-        canvas.drawOval(size * 0.32f, size * 0.88f, size * 0.68f, size * 0.97f, paint)
+        paint.color = Color.argb(70, 0, 0, 0)
+        canvas.drawOval(size * 0.34f, size * 0.87f, size * 0.66f, size * 0.96f, paint)
 
         paint.color = color
         val pin = Path().apply {
@@ -541,12 +563,30 @@ class LiveMapView(context: Context) : FrameLayout(context) {
 
         paint.color = Color.WHITE
         canvas.drawCircle(cx, headCy, headR, paint)
+
         paint.color = Color.rgb(17, 24, 39)
-        paint.typeface = Typeface.DEFAULT_BOLD
-        paint.textAlign = Paint.Align.CENTER
-        paint.textSize = size * 0.22f
-        val textY = headCy - (paint.descent() + paint.ascent()) / 2f
-        canvas.drawText("E", cx, textY, paint)
+        paint.style = Paint.Style.STROKE
+        paint.strokeCap = Paint.Cap.ROUND
+        paint.strokeJoin = Paint.Join.ROUND
+        paint.strokeWidth = size * 0.045f
+
+        val wheelR = headR * 0.22f
+        val leftWheelX = cx - headR * 0.42f
+        val rightWheelX = cx + headR * 0.42f
+        val wheelY = headCy + headR * 0.28f
+        canvas.drawCircle(leftWheelX, wheelY, wheelR, paint)
+        canvas.drawCircle(rightWheelX, wheelY, wheelR, paint)
+
+        val crankX = cx - headR * 0.05f
+        val crankY = headCy + headR * 0.05f
+        canvas.drawLine(leftWheelX, wheelY, crankX, crankY, paint)
+        canvas.drawLine(crankX, crankY, rightWheelX, wheelY, paint)
+        canvas.drawLine(crankX, crankY, cx + headR * 0.18f, headCy - headR * 0.22f, paint)
+        canvas.drawLine(cx + headR * 0.18f, headCy - headR * 0.22f, rightWheelX, wheelY, paint)
+        canvas.drawLine(cx - headR * 0.22f, headCy - headR * 0.18f, cx + headR * 0.08f, headCy - headR * 0.18f, paint)
+        canvas.drawLine(cx + headR * 0.18f, headCy - headR * 0.22f, cx + headR * 0.46f, headCy - headR * 0.34f, paint)
+        paint.style = Paint.Style.FILL
+
         return BitmapDrawable(resources, bitmap)
     }
 
@@ -693,7 +733,7 @@ class LiveMapView(context: Context) : FrameLayout(context) {
         private const val SOS_PIN_SIZE_DP = 58
         private const val RIDER_PIN_SIZE_DP = 58
         private const val DESTINATION_PIN_SIZE_DP = 58
-        private const val EVENT_PIN_SIZE_DP = 54
+        private const val EVENT_PIN_SIZE_DP = 46
         private const val ARROW_SIZE_DP = 42
         private const val EDGE_ARROW_MARGIN_DP = 34
         private const val MAX_RIDER_ICON_CACHE = 80
