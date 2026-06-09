@@ -22,41 +22,28 @@ It uses the same shared services and keys:
    `open CoRider.xcodeproj`
 7. In Xcode, set your Apple Team, enable Background Modes for `Location updates` and `Audio`, then run on a real iPhone.
 
-## GitHub iOS Build
+## GitHub iOS Build Without Apple Signing
 
-The repo includes `.github/workflows/ios-build.yml` so GitHub can build the iOS app on a hosted macOS runner.
+The repo includes `.github/workflows/ios-build.yml` so GitHub can compile the iOS app on a hosted macOS runner without Apple signing or an Apple Developer Program account.
 
-### Build without Apple signing
+Push the code or run **Actions > iOS Build > Run workflow**. The workflow uploads:
 
-Push the code or run **Actions > iOS Build > Run workflow** with `Build signed iPhone IPA` left unchecked. The `Build iOS simulator app` job creates a simulator artifact named `corider-ios-simulator-app`.
+- `corider-ios-simulator-app`: a zipped simulator `.app` from the Debug build.
+- `corider-ios-unsigned-ipa`: an unsigned `.ipa` from the Release iPhone build.
 
-This proves the iOS code compiles, but it cannot be installed on a physical iPhone.
+The unsigned IPA does not require an Apple Developer account, but it is not installable on a normal physical iPhone because iOS requires apps to be signed with a trusted certificate and provisioning profile. Use it as a build artifact only, or sign it later if you get signing credentials.
 
-### Build signed IPA for iPhone
-
-To produce an installable `.ipa`, add these GitHub repository secrets:
+Optional GitHub repository secrets:
 
 - `IOS_AGORA_APP_ID`: same Agora App ID used by Android.
 - `IOS_AGORA_TOKEN`: blank is okay while Agora token auth is disabled for testing.
-- `IOS_GOOGLE_SERVICE_INFO_PLIST_BASE64`: base64 of `GoogleService-Info.plist`.
-- `IOS_CERTIFICATE_BASE64`: base64 of Apple development `.p12` certificate.
-- `IOS_CERTIFICATE_PASSWORD`: password used when exporting the `.p12`.
-- `IOS_PROVISIONING_PROFILE_BASE64`: base64 of the `.mobileprovision` file.
-- `IOS_PROVISIONING_PROFILE_NAME`: provisioning profile display name.
-- `IOS_TEAM_ID`: Apple Developer Team ID.
-- `IOS_KEYCHAIN_PASSWORD`: any temporary password for the CI keychain.
+- `IOS_GOOGLE_SERVICE_INFO_PLIST_BASE64`: base64 of `GoogleService-Info.plist`, needed for a runnable Firebase-backed simulator build.
 
-Then run **Actions > iOS Build > Run workflow** and check `Build signed iPhone IPA`. The `Build signed iPhone IPA` job uploads `corider-ios-signed-ipa`.
-
-On macOS, create the base64 values with:
+On macOS, create the Firebase base64 value with:
 
 ```bash
 base64 -i GoogleService-Info.plist | pbcopy
-base64 -i certificate.p12 | pbcopy
-base64 -i profile.mobileprovision | pbcopy
 ```
-
-After the workflow finishes, open the completed run and download the artifact from the **Artifacts** section at the bottom of the run summary.
 
 Official setup references:
 

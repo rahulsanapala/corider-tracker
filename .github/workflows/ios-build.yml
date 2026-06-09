@@ -11,17 +11,19 @@ on:
       - "ios/**"
       - ".github/workflows/ios-build.yml"
   workflow_dispatch:
-    inputs:
-      build_signed_ipa:
-        description: "Build signed iPhone IPA. Requires Apple signing secrets."
-        required: false
-        default: false
-        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  simulator:
-    name: Build iOS simulator app
+  unsigned:
+    name: Build unsigned iOS artifacts
     runs-on: macos-latest
+    timeout-minutes: 60
 
     env:
       IOS_AGORA_APP_ID: ${{ secrets.IOS_AGORA_APP_ID }}
@@ -30,7 +32,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -38,165 +43,101 @@ jobs:
       - name: Create local iOS config
         working-directory: ios/CoRider
         run: |
+          set -euo pipefail
+
           cat > Config.xcconfig <<EOF
           AGORA_APP_ID = ${IOS_AGORA_APP_ID:-your_agora_app_id_here}
           AGORA_TOKEN = ${IOS_AGORA_TOKEN:-}
           EOF
-          if [ -n "$IOS_GOOGLE_SERVICE_INFO_PLIST_BASE64" ]; then
-            echo "$IOS_GOOGLE_SERVICE_INFO_PLIST_BASE64" | base64 --decode > CoRider/GoogleService-Info.plist
+
+          if [ -n "${IOS_GOOGLE_SERVICE_INFO_PLIST_BASE64:-}" ]; then
+            printf '%s' "$IOS_GOOGLE_SERVICE_INFO_PLIST_BASE64" | base64 -D > CoRider/GoogleService-Info.plist
           fi
 
       - name: Generate Xcode project
         working-directory: ios/CoRider
         run: xcodegen generate
 
+      - name: Resolve Swift packages
+        working-directory: ios/CoRider
+        run: |
+          xcodebuild \
+            -project CoRider.xcodeproj \
+            -scheme CoRider \
+            -resolvePackageDependencies
+
       - name: Build simulator app
         working-directory: ios/CoRider
         run: |
-          set -o pipefail
+          set -euo pipefail
           xcodebuild \
             -project CoRider.xcodeproj \
             -scheme CoRider \
             -configuration Debug \
             -sdk iphonesimulator \
             -destination 'generic/platform=iOS Simulator' \
-            CODE_SIGNING_ALLOWED=NO \
             -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
             build
 
-      - name: Package simulator artifact
+      - name: Build unsigned iPhone app
         working-directory: ios/CoRider
         run: |
-          mkdir -p build/artifacts
-          APP_PATH="$(find build/DerivedData/Build/Products/Debug-iphonesimulator -name 'CoRider.app' -type d | head -n 1)"
-          if [ -z "$APP_PATH" ]; then
-            echo "CoRider.app was not produced"
-            exit 1
-          fi
-          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" build/artifacts/CoRider-simulator-app.zip
-
-      - name: Upload simulator app
-        uses: actions/upload-artifact@v6
-        with:
-          name: corider-ios-simulator-app
-          path: ios/CoRider/build/artifacts/CoRider-simulator-app.zip
-          if-no-files-found: error
-
-  signed-ipa:
-    name: Build signed iPhone IPA
-    runs-on: macos-latest
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_signed_ipa == true }}
-
-    env:
-      IOS_AGORA_APP_ID: ${{ secrets.IOS_AGORA_APP_ID }}
-      IOS_AGORA_TOKEN: ${{ secrets.IOS_AGORA_TOKEN }}
-      IOS_GOOGLE_SERVICE_INFO_PLIST_BASE64: ${{ secrets.IOS_GOOGLE_SERVICE_INFO_PLIST_BASE64 }}
-      IOS_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
-      IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
-      IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
-      IOS_PROVISIONING_PROFILE_NAME: ${{ secrets.IOS_PROVISIONING_PROFILE_NAME }}
-      IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
-      KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Validate required signing secrets
-        run: |
-          missing=0
-          for name in IOS_AGORA_APP_ID IOS_GOOGLE_SERVICE_INFO_PLIST_BASE64 IOS_CERTIFICATE_BASE64 IOS_CERTIFICATE_PASSWORD IOS_PROVISIONING_PROFILE_BASE64 IOS_PROVISIONING_PROFILE_NAME IOS_TEAM_ID; do
-            if [ -z "${!name}" ]; then
-              echo "Missing GitHub secret: $name"
-              missing=1
-            fi
-          done
-          if [ "$missing" -ne 0 ]; then
-            exit 1
-          fi
-
-      - name: Install XcodeGen
-        run: brew install xcodegen
-
-      - name: Create local iOS config
-        working-directory: ios/CoRider
-        run: |
-          cat > Config.xcconfig <<EOF
-          AGORA_APP_ID = ${IOS_AGORA_APP_ID}
-          AGORA_TOKEN = ${IOS_AGORA_TOKEN:-}
-          EOF
-          echo "$IOS_GOOGLE_SERVICE_INFO_PLIST_BASE64" | base64 --decode > CoRider/GoogleService-Info.plist
-
-      - name: Install signing certificate and profile
-        run: |
-          KEYCHAIN_PATH="$RUNNER_TEMP/corider-signing.keychain-db"
-          CERTIFICATE_PATH="$RUNNER_TEMP/certificate.p12"
-          PROFILE_PATH="$RUNNER_TEMP/profile.mobileprovision"
-          KEYCHAIN_PASSWORD="${KEYCHAIN_PASSWORD:-temporary-ci-keychain-password}"
-
-          echo "$IOS_CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
-          echo "$IOS_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
-
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security import "$CERTIFICATE_PATH" -P "$IOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security list-keychain -d user -s "$KEYCHAIN_PATH"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
-          UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin <<< "$(security cms -D -i "$PROFILE_PATH")")
-          cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
-
-      - name: Generate Xcode project
-        working-directory: ios/CoRider
-        run: xcodegen generate
-
-      - name: Archive iPhone app
-        working-directory: ios/CoRider
-        run: |
-          set -o pipefail
+          set -euo pipefail
           xcodebuild \
             -project CoRider.xcodeproj \
             -scheme CoRider \
             -configuration Release \
             -sdk iphoneos \
-            -archivePath build/CoRider.xcarchive \
-            DEVELOPMENT_TEAM="$IOS_TEAM_ID" \
-            CODE_SIGN_STYLE=Manual \
-            PROVISIONING_PROFILE_SPECIFIER="$IOS_PROVISIONING_PROFILE_NAME" \
-            archive
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            build
 
-      - name: Export IPA
+      - name: Package artifacts
         working-directory: ios/CoRider
         run: |
-          cat > build/ExportOptions.plist <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key>
-            <string>development</string>
-            <key>signingStyle</key>
-            <string>manual</string>
-            <key>teamID</key>
-            <string>${IOS_TEAM_ID}</string>
-            <key>provisioningProfiles</key>
-            <dict>
-              <key>com.corider.tracker.ios</key>
-              <string>${IOS_PROVISIONING_PROFILE_NAME}</string>
-            </dict>
-          </dict>
-          </plist>
-          EOF
-          xcodebuild -exportArchive \
-            -archivePath build/CoRider.xcarchive \
-            -exportPath build/ipa \
-            -exportOptionsPlist build/ExportOptions.plist
+          set -euo pipefail
 
-      - name: Upload signed IPA
-        uses: actions/upload-artifact@v6
+          mkdir -p build/artifacts
+
+          SIMULATOR_APP_PATH="$(find build/DerivedData/Build/Products/Debug-iphonesimulator -name 'CoRider.app' -type d | head -n 1)"
+          if [ -z "$SIMULATOR_APP_PATH" ]; then
+            echo "CoRider.app was not produced for the simulator"
+            exit 1
+          fi
+          ditto -c -k --sequesterRsrc --keepParent "$SIMULATOR_APP_PATH" build/artifacts/CoRider-simulator-app.zip
+
+          DEVICE_APP_PATH="$(find build/DerivedData/Build/Products/Release-iphoneos -name 'CoRider.app' -type d | head -n 1)"
+          if [ -z "$DEVICE_APP_PATH" ]; then
+            echo "CoRider.app was not produced for iPhone"
+            exit 1
+          fi
+
+          rm -rf build/unsigned-ipa
+          mkdir -p build/unsigned-ipa/Payload
+          ditto "$DEVICE_APP_PATH" build/unsigned-ipa/Payload/CoRider.app
+          (
+            cd build/unsigned-ipa
+            ditto -c -k --sequesterRsrc --keepParent Payload ../artifacts/CoRider-unsigned.ipa
+          )
+
+      - name: Upload simulator app
+        uses: actions/upload-artifact@v4
         with:
-          name: corider-ios-signed-ipa
-          path: ios/CoRider/build/ipa/*.ipa
+          name: corider-ios-simulator-app
+          path: ios/CoRider/build/artifacts/CoRider-simulator-app.zip
+          if-no-files-found: error
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: corider-ios-unsigned-ipa
+          path: ios/CoRider/build/artifacts/CoRider-unsigned.ipa
           if-no-files-found: error
