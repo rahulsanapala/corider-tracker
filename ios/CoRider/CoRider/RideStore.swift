@@ -1,6 +1,7 @@
 import AudioToolbox
 import CoreLocation
 import FirebaseAuth
+import FirebaseCore
 import FirebaseDatabase
 import Foundation
 import UserNotifications
@@ -22,7 +23,7 @@ final class RideStore: NSObject, ObservableObject, CLLocationManagerDelegate {
 
     let riderId: String
 
-    private let database = Database.database().reference()
+    private lazy var database = Database.database().reference()
     private let locationManager = CLLocationManager()
     private var rootRef: DatabaseReference?
     private var ridersRef: DatabaseReference?
@@ -520,6 +521,10 @@ final class RideStore: NSObject, ObservableObject, CLLocationManagerDelegate {
     }
 
     private func signInIfNeeded(_ completion: @escaping () -> Void) {
+        guard FirebaseApp.app() != nil else {
+            status = "Firebase config is missing. Add GoogleService-Info.plist."
+            return
+        }
         if Auth.auth().currentUser != nil {
             completion()
             return
