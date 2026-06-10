@@ -29,7 +29,7 @@ The repo includes `.github/workflows/ios-build.yml` so GitHub can compile the iO
 Push the code or run **Actions > iOS Build > Run workflow**. The workflow uploads:
 
 - `corider-ios-simulator-app`: a zipped simulator `.app` from the Debug build.
-- `corider-ios-simulator-smoke-test`: launch output, simulator screenshot, simulator logs, and crash reports if the app crashes on launch.
+- `corider-ios-simulator-smoke-test`: XCTest launch output, simulator screenshot, simulator logs, `.xcresult` diagnostics, and crash reports if the app crashes on launch.
 - `corider-ios-unsigned-ipa`: an unsigned `.ipa` from the Release iPhone build.
 
 The unsigned IPA does not require an Apple Developer account, but it is not installable on a normal physical iPhone because iOS requires apps to be signed with a trusted certificate and provisioning profile. Use it as a build artifact only, or sign it later if you get signing credentials.
@@ -42,9 +42,9 @@ Use the GitHub Actions simulator smoke test:
 2. Open the completed workflow run.
 3. Download `corider-ios-simulator-smoke-test`.
 4. Open `CoRider-simulator-smoke.png` to see the launched app screen.
-5. If the workflow fails, check `CoRider-simulator-launch.txt`, `CoRider-simulator.log`, and any files under `crash-reports/`.
+5. If the workflow fails, check `CoRider-simulator-launch.txt`, `CoRider-simulator.log`, `CoRiderSmoke.xcresult/`, and any files under `crash-reports/`.
 
-This is the closest no-device test path available from Windows. Apple's iOS Simulator itself only runs on macOS/Xcode, so GitHub Actions provides the hosted Mac that boots the simulator for you.
+This is the closest no-device test path available from Windows. Apple's iOS Simulator itself only runs on macOS/Xcode, so GitHub Actions provides the hosted Mac that builds, boots the simulator, and launches the app with XCTest.
 
 Optional GitHub repository secrets:
 

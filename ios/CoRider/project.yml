@@ -42,11 +42,29 @@ targets:
         product: RtcBasic
     entitlements:
       path: CoRider/CoRider.entitlements
+  CoRiderUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - CoRiderUITests
+    info:
+      path: CoRiderUITests/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.corider.tracker.ios.uitests
+        PRODUCT_NAME: CoRiderUITests
+        TEST_TARGET_NAME: CoRider
+    dependencies:
+      - target: CoRider
 schemes:
   CoRider:
     build:
       targets:
         CoRider: all
+        CoRiderUITests: [test]
+    test:
+      targets:
+        - CoRiderUITests
     run:
       config: Debug
     archive:

@@ -83,12 +83,11 @@ jobs:
             DEVELOPMENT_TEAM="" \
             build
 
-      - name: Launch app in iOS Simulator
+      - name: Run iOS Simulator smoke test
         working-directory: ios/CoRider
         run: |
           set -euo pipefail
 
-          BUNDLE_ID="com.corider.tracker.ios"
           mkdir -p build/artifacts
 
           SIMULATOR_UDID="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ && /Shutdown|Booted/ { print $2; exit }')"
@@ -102,27 +101,30 @@ jobs:
           xcrun simctl boot "$SIMULATOR_UDID" || true
           xcrun simctl bootstatus "$SIMULATOR_UDID" -b
 
-          SIMULATOR_APP_PATH="$(find build/DerivedData/Build/Products/Debug-iphonesimulator -name 'CoRider.app' -type d | head -n 1)"
-          if [ -z "$SIMULATOR_APP_PATH" ]; then
-            echo "CoRider.app was not produced for the simulator"
-            exit 1
-          fi
-
-          xcrun simctl install "$SIMULATOR_UDID" "$SIMULATOR_APP_PATH"
           touch build/artifacts/smoke-start.marker
 
           set +e
-          xcrun simctl launch "$SIMULATOR_UDID" "$BUNDLE_ID" > build/artifacts/CoRider-simulator-launch.txt 2>&1
-          LAUNCH_STATUS=$?
+          xcodebuild \
+            -project CoRider.xcodeproj \
+            -scheme CoRider \
+            -configuration Debug \
+            -destination "id=$SIMULATOR_UDID" \
+            -derivedDataPath build/DerivedData \
+            -resultBundlePath build/artifacts/CoRiderSmoke.xcresult \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            test > build/artifacts/CoRider-simulator-launch.txt 2>&1
+          TEST_STATUS=$?
           set -e
 
           cat build/artifacts/CoRider-simulator-launch.txt
-          sleep 12
 
           xcrun simctl io "$SIMULATOR_UDID" screenshot build/artifacts/CoRider-simulator-smoke.png || true
           xcrun simctl spawn "$SIMULATOR_UDID" log show \
             --style compact \
-            --last 2m \
+            --last 5m \
             --predicate 'process == "CoRider" OR eventMessage CONTAINS "com.corider.tracker.ios" OR eventMessage CONTAINS "Firebase"' \
             > build/artifacts/CoRider-simulator.log || true
 
@@ -137,9 +139,9 @@ jobs:
             exit 1
           fi
 
-          if [ "$LAUNCH_STATUS" -ne 0 ]; then
-            echo "CoRider failed to launch in the simulator"
-            exit "$LAUNCH_STATUS"
+          if [ "$TEST_STATUS" -ne 0 ]; then
+            echo "CoRider failed the simulator launch smoke test"
+            exit "$TEST_STATUS"
           fi
 
       - name: Upload simulator smoke test artifacts
@@ -151,6 +153,7 @@ jobs:
             ios/CoRider/build/artifacts/CoRider-simulator-launch.txt
             ios/CoRider/build/artifacts/CoRider-simulator-smoke.png
             ios/CoRider/build/artifacts/CoRider-simulator.log
+            ios/CoRider/build/artifacts/CoRiderSmoke.xcresult/**
             ios/CoRider/build/artifacts/crash-reports/**
           if-no-files-found: ignore
 
