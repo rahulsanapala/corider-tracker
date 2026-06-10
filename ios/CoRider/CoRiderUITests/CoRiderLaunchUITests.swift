@@ -10,10 +10,26 @@ final class CoRiderLaunchUITests: XCTestCase {
         app.launch()
 
         XCTAssertTrue(app.wait(for: .runningForeground, timeout: 15))
+        handleSystemAlerts()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 5))
 
         let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         attachment.name = "CoRider launch screen"
         attachment.lifetime = .keepAlways
         add(attachment)
+    }
+
+    private func handleSystemAlerts() {
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+
+        let allowButton = springboard.buttons["Allow"]
+        if allowButton.waitForExistence(timeout: 5) {
+            allowButton.tap()
+        }
+
+        let whileUsingButton = springboard.buttons["Allow While Using App"]
+        if whileUsingButton.waitForExistence(timeout: 2) {
+            whileUsingButton.tap()
+        }
     }
 }
