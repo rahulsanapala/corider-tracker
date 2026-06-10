@@ -47,7 +47,6 @@ final class RideStore: NSObject, ObservableObject, CLLocationManagerDelegate {
         locationManager.delegate = self
         locationManager.desiredAccuracy = kCLLocationAccuracyBest
         locationManager.distanceFilter = 5
-        locationManager.allowsBackgroundLocationUpdates = true
         locationManager.pausesLocationUpdatesAutomatically = false
         requestNotifications()
     }
@@ -124,6 +123,7 @@ final class RideStore: NSObject, ObservableObject, CLLocationManagerDelegate {
             }
             self.observeGroup(group.code)
             self.locationManager.requestAlwaysAuthorization()
+            self.enableBackgroundLocationUpdatesIfAllowed()
             self.locationManager.startUpdatingLocation()
             self.status = "Sharing live location in \(group.displayName)"
         }
@@ -275,6 +275,7 @@ final class RideStore: NSObject, ObservableObject, CLLocationManagerDelegate {
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         if manager.authorizationStatus == .authorizedAlways || manager.authorizationStatus == .authorizedWhenInUse {
+            enableBackgroundLocationUpdatesIfAllowed()
             manager.startUpdatingLocation()
         }
     }
@@ -461,6 +462,13 @@ final class RideStore: NSObject, ObservableObject, CLLocationManagerDelegate {
 
     private func requestNotifications() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    private func enableBackgroundLocationUpdatesIfAllowed() {
+        guard locationManager.authorizationStatus == .authorizedAlways,
+              let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String],
+              modes.contains("location") else { return }
+        locationManager.allowsBackgroundLocationUpdates = true
     }
 
     private func notify(title: String, body: String) {
