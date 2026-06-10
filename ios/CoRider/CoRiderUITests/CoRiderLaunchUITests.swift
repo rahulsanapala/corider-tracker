@@ -12,6 +12,7 @@ final class CoRiderLaunchUITests: XCTestCase {
         XCTAssertTrue(app.wait(for: .runningForeground, timeout: 15))
         handleSystemAlerts()
         XCTAssertTrue(app.wait(for: .runningForeground, timeout: 5))
+        XCTAssertTrue(app.tabBars.buttons["Map"].waitForExistence(timeout: 10))
 
         let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         attachment.name = "CoRider launch screen"

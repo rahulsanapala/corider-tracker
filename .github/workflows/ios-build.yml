@@ -121,6 +121,11 @@ jobs:
 
           cat build/artifacts/CoRider-simulator-launch.txt
 
+          if [ "$TEST_STATUS" -eq 0 ]; then
+            xcrun simctl launch "$SIMULATOR_UDID" com.corider.tracker.ios > build/artifacts/CoRider-simulator-relaunch.txt 2>&1 || true
+            sleep 5
+          fi
+
           xcrun simctl io "$SIMULATOR_UDID" screenshot build/artifacts/CoRider-simulator-smoke.png || true
           xcrun simctl spawn "$SIMULATOR_UDID" log show \
             --style compact \
@@ -151,6 +156,7 @@ jobs:
           name: corider-ios-simulator-smoke-test
           path: |
             ios/CoRider/build/artifacts/CoRider-simulator-launch.txt
+            ios/CoRider/build/artifacts/CoRider-simulator-relaunch.txt
             ios/CoRider/build/artifacts/CoRider-simulator-smoke.png
             ios/CoRider/build/artifacts/CoRider-simulator.log
             ios/CoRider/build/artifacts/CoRiderSmoke.xcresult/**
